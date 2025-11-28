@@ -1538,12 +1538,16 @@ class PumpSniper:
             if not mint:
                 return None
 
-            # Calculate age from created_timestamp
+            # Calculate age from created_timestamp (handle both ms and seconds)
             created_ts = coin.get('created_timestamp', 0)
             age_min = 9999
             if created_ts:
                 try:
-                    age_min = (time.time() * 1000 - created_ts) / (1000 * 60)
+                    # Pump.fun API returns timestamp in milliseconds
+                    if created_ts > 1e12:  # Timestamp is in milliseconds
+                        age_min = (time.time() * 1000 - created_ts) / (1000 * 60)
+                    else:  # Timestamp is in seconds
+                        age_min = (time.time() - created_ts) / 60
                 except:
                     pass
 
@@ -1556,6 +1560,8 @@ class PumpSniper:
             reply_count = int(coin.get('reply_count', 0) or 0)
 
             # Build Token object from pump.fun data
+            # Note: Pump.fun tokens typically have ~10% of market cap as liquidity
+            estimated_liquidity = mcap * 0.1 if mcap > 0 else 0
             token = Token(
                 symbol=str(coin.get('symbol', '?'))[:12],
                 name=str(coin.get('name', ''))[:30],
@@ -1564,7 +1570,7 @@ class PumpSniper:
                 pair_address=mint,  # Use mint as pair address for pump.fun
                 price=0,  # Will be fetched from PumpPortal
                 market_cap=mcap,
-                liquidity=mcap * 0.1 if mcap > 0 else 0,  # Estimate liquidity
+                liquidity=estimated_liquidity,
                 volume_5m=0,
                 volume_1h=0,
                 volume_24h=0,
@@ -1599,8 +1605,9 @@ class PumpSniper:
             # Skip if no valid price or liquidity too low
             if token.price <= 0:
                 # Try to estimate price from market cap
+                # Pump.fun tokens typically have ~1 billion total supply
+                # This is a rough estimate when PumpPortal doesn't return price
                 if mcap > 0:
-                    # Assume 1B token supply for pump.fun tokens
                     token.price = mcap / 1e9
                 else:
                     return None
@@ -1673,7 +1680,11 @@ class PumpSniper:
             created = data.get('created_timestamp', 0)
             if created:
                 try:
-                    token.age_minutes = (time.time() * 1000 - created) / (1000 * 60)
+                    # Handle both milliseconds and seconds timestamps
+                    if created > 1e12:  # Timestamp is in milliseconds
+                        token.age_minutes = (time.time() * 1000 - created) / (1000 * 60)
+                    else:  # Timestamp is in seconds
+                        token.age_minutes = (time.time() - created) / 60
                 except:
                     pass
 
@@ -1719,6 +1730,7 @@ class PumpSniper:
             signals['reasons'].append(f"⏰ {token.age_minutes:.0f}m")
 
         # MARKET CAP SCORING (Pump.fun specific ranges)
+        # Note: Check specific ranges first, then fall through to broader ranges
         if mcap > 0:
             if 3000 <= mcap < 10000:
                 signals['score'] += 35
@@ -1730,10 +1742,15 @@ class PumpSniper:
                 signals['score'] += 35
                 signals['reasons'].append(f"✨ Good ${mcap/1000:.0f}k")
             elif 60000 <= mcap <= 90000:
-                # GRADUATING - about to hit Raydium!
+                # GRADUATING - about to hit Raydium! (takes priority over 50-100k range)
                 signals['score'] += 60
                 signals['reasons'].append(f"🚀 GRADUATING ${mcap/1000:.0f}k!")
-            elif 50000 <= mcap < 100000:
+            elif 50000 <= mcap < 60000:
+                # Just under graduating threshold
+                signals['score'] += 30
+                signals['reasons'].append(f"📊 ${mcap/1000:.0f}k mcap")
+            elif 90000 < mcap < 100000:
+                # Just past graduation, still okay
                 signals['score'] += 25
                 signals['reasons'].append(f"📊 ${mcap/1000:.0f}k mcap")
 
