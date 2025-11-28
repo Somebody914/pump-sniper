@@ -1,0 +1,2497 @@
+import requests
+import time
+from colorama import Fore, Style, init
+import datetime
+import threading
+import json
+from dataclasses import dataclass, field
+import os
+import webbrowser
+import asyncio
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REAL TRADING IMPORTS - Install with:
+# pip install solana solders httpx base58 --break-system-packages
+# ═══════════════════════════════════════════════════════════════════════════════
+try:
+    import base58
+    import httpx
+    from solders.keypair import Keypair
+    from solders.pubkey import Pubkey
+    from solders.transaction import VersionedTransaction
+    from solana.rpc.api import Client
+    from solana.rpc.commitment import Confirmed, Processed
+    from solana.rpc.types import TokenAccountOpts
+
+    REAL_TRADING_AVAILABLE = True
+except ImportError:
+    REAL_TRADING_AVAILABLE = False
+    print("⚠️ Real trading packages not installed. Run:")
+    print("   pip install solana solders httpx base58 --break-system-packages")
+
+init(autoreset=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+PAPER_TRADE = True  # ← SET TO False FOR REAL TRADING (only after testing!)
+
+INITIAL_BALANCE = 10000  # Only used for paper trading
+BUY_AMOUNT_PERCENT = 20
+MAX_POSITIONS = 4
+
+# ENTRY FILTERS
+MIN_LIQUIDITY = 8000
+MIN_INSIDER_SCORE = 75
+MIN_CHANGE_5M = 3.0
+
+# EXIT STRATEGY
+TAKE_PROFIT_PERCENT = 32
+STOP_LOSS_PERCENT = 7.5
+TRAILING_STOP_PERCENT = 6
+TIME_STOP_MINUTES = 11
+
+# TIMING
+SCAN_INTERVAL = 3
+PRICE_UPDATE_INTERVAL = 3
+COOLDOWN_AFTER_TRADE = 120
+
+# RUG PULL PROTECTION
+RUG_LIQUIDITY_DROP_PERCENT = 30
+RUG_LIQUIDITY_CRITICAL = 3000
+RUG_PRICE_CRASH_PERCENT = 18
+RUG_SELL_PRESSURE_THRESHOLD = 0.30
+RUG_VOLUME_SPIKE_SELLS = 4
+RUG_MCAP_LIQ_RATIO_MAX = 70
+
+TRADE_LOG_FILE = "trade_history.json"
+PORTFOLIO_FILE = "portfolio.json"
+
+MAX_FETCH_FAILURES = 3
+MIN_ALIVE_LIQUIDITY = 50
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REAL TRADING CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ⚠️ PASTE YOUR PHANTOM PRIVATE KEY BELOW (between the quotes)
+# Get it from: Phantom → Settings → Security & Privacy → Export Private Key
+PRIVATE_KEY = ""  # ← PASTE YOUR KEY HERE
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RPC CONFIGURATION - Get free Helius key at https://dev.helius.xyz/
+# The public RPC is slow and unreliable for trading!
+# ═══════════════════════════════════════════════════════════════════════════════
+HELIUS_API_KEY = "153ed6a5-3c25-4f7e-a24b-50b59ec51eb2"  # ← PASTE YOUR FREE HELIUS API KEY HERE (just the key, not the full URL)
+
+# Will use Helius if key provided, otherwise fall back to public (not recommended)
+if HELIUS_API_KEY and len(HELIUS_API_KEY) > 10:
+    SOLANA_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+else:
+    SOLANA_RPC = "https://api.mainnet-beta.solana.com"
+    print("⚠️ WARNING: Using public RPC - get free Helius key at https://dev.helius.xyz/")
+
+JUPITER_QUOTE_API = "https://lite-api.jup.ag/swap/v1/quote"
+JUPITER_SWAP_API = "https://lite-api.jup.ag/swap/v1/swap"
+PUMPPORTAL_API = "https://pumpportal.fun/api/trade-local"
+
+SOL_MINT = "So11111111111111111111111111111111111111112"
+SLIPPAGE_BPS = 250  # 2.5% slippage for buys (was 10% - way too high!)
+SELL_SLIPPAGE_BPS = 400  # 4% slippage for sells (was 12%)
+MIN_SOL_KEEP = 0.02  # Keep for fees
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TRANSACTION SETTINGS - Uses balance checking, not RPC confirmation
+# ═══════════════════════════════════════════════════════════════════════════════
+MAX_TX_RETRIES = 1  # Only try ONCE to prevent double-buys
+TX_TIMEOUT = 15  # 15s should be enough - tokens arrive fast on Solana
+TX_CONFIRM_SLEEP = 0.3  # Check every 0.3 seconds for faster detection
+REQUIRE_CONFIRMATION = True
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REALISTIC PAPER TRADING FEES - Simulates real trading costs
+# ═══════════════════════════════════════════════════════════════════════════════
+PAPER_REALISTIC_FEES = True  # Set to False for old-style paper trading (no fees)
+
+# Transaction fees (per trade - buy OR sell)
+PAPER_BASE_FEE_SOL = 0.000005  # Solana base fee (~0.000005 SOL)
+PAPER_PRIORITY_FEE_SOL = 0.0002  # Priority fee for faster execution
+PAPER_TOTAL_TX_FEE_SOL = PAPER_BASE_FEE_SOL + PAPER_PRIORITY_FEE_SOL  # ~0.000205 SOL per tx
+
+# Slippage simulation (percentage of trade value lost to slippage)
+PAPER_BUY_SLIPPAGE_PERCENT = 1.5  # 1.5% slippage on buys (price moves up as you buy)
+PAPER_SELL_SLIPPAGE_PERCENT = 2.0  # 2.0% slippage on sells (price moves down as you sell, + urgency)
+
+# DEX fees (Jupiter/Raydium typically charge 0.25-0.3%)
+PAPER_DEX_FEE_PERCENT = 0.25  # 0.25% DEX swap fee
+
+# Combined effective cost per trade (one-way)
+# Buy: 1.5% slippage + 0.25% DEX = 1.75%
+# Sell: 2.0% slippage + 0.25% DEX = 2.25%
+# Round trip: ~4% total drag on each position!
+
+# SOL price for fee calculations (will be updated dynamically if possible)
+PAPER_SOL_PRICE_DEFAULT = 150.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REAL TRADING MODULE - FIXED VERSION
+# ═══════════════════════════════════════════════════════════════════════════════
+@dataclass
+class TradeResult:
+    success: bool
+    tx_hash: str = None
+    amount_in: float = 0
+    amount_out: float = 0
+    error: str = None
+    fee_sol: float = 0  # Transaction fee in SOL
+
+
+class SolanaTrader:
+    """Real Solana trading via Jupiter aggregator - FIXED VERSION"""
+
+    def __init__(self):
+        if not REAL_TRADING_AVAILABLE:
+            raise ImportError("Real trading packages not installed")
+
+        # Use hardcoded key first, then check environment variable
+        private_key = PRIVATE_KEY if PRIVATE_KEY else os.environ.get('WALLET_PRIVATE_KEY')
+        if not private_key:
+            raise ValueError(
+                "❌ No private key found!\n"
+                "Either paste your key in PRIVATE_KEY at line 67,\n"
+                "or run: export WALLET_PRIVATE_KEY='your_base58_private_key'"
+            )
+
+        try:
+            if private_key.startswith('['):
+                key_bytes = bytes(json.loads(private_key))
+                self.keypair = Keypair.from_bytes(key_bytes)
+            else:
+                key_bytes = base58.b58decode(private_key)
+                self.keypair = Keypair.from_bytes(key_bytes)
+        except Exception as e:
+            raise ValueError(f"❌ Invalid private key: {e}")
+
+        self.client = Client(SOLANA_RPC, commitment=Confirmed)
+        self.pubkey = self.keypair.pubkey()
+
+        # ═══════════════════════════════════════════════════════════════════
+        # NEW: Track pending transactions to prevent double-buys
+        # ═══════════════════════════════════════════════════════════════════
+        self.pending_tx: dict[str, float] = {}  # tx_hash -> timestamp
+        self.recent_buys: dict[str, float] = {}  # token_mint -> timestamp
+
+        print(Fore.GREEN + f"✅ Wallet loaded: {str(self.pubkey)[:20]}...")
+        if HELIUS_API_KEY and len(HELIUS_API_KEY) > 10:
+            print(Fore.GREEN + f"🚀 Using Helius RPC (fast)")
+        else:
+            print(Fore.YELLOW + f"⚠️ Using public RPC (slow) - get Helius key for better performance")
+        self._check_balance()
+
+    def _check_balance(self) -> float:
+        try:
+            resp = self.client.get_balance(self.pubkey)
+            balance = resp.value / 1e9
+            print(Fore.GREEN + f"💰 SOL Balance: {balance:.4f} SOL")
+            return balance
+        except Exception as e:
+            print(Fore.RED + f"⚠️ Balance check failed: {e}")
+            return 0
+
+    def get_sol_balance(self) -> float:
+        return self._check_balance()
+
+    def get_token_balance(self, mint: str, silent: bool = False) -> float:
+        """Get token balance - used to verify buys completed"""
+        try:
+            mint_pubkey = Pubkey.from_string(mint)
+            opts = TokenAccountOpts(mint=mint_pubkey)
+
+            resp = self.client.get_token_accounts_by_owner_json_parsed(
+                self.pubkey,
+                opts
+            )
+            if resp.value:
+                for account in resp.value:
+                    try:
+                        info = account.account.data.parsed['info']
+                        balance = float(info['tokenAmount']['uiAmount'] or 0)
+                        if balance > 0 and not silent:
+                            print(Fore.GREEN + f"   💰 Token balance: {balance:,.2f}")
+                        return balance
+                    except (KeyError, TypeError, AttributeError) as e:
+                        # Try alternate response format
+                        try:
+                            data = account.account.data
+                            if hasattr(data, 'parsed'):
+                                info = data.parsed.get('info', {})
+                            else:
+                                info = data.get('parsed', {}).get('info', {})
+                            balance = float(info.get('tokenAmount', {}).get('uiAmount') or 0)
+                            if balance > 0 and not silent:
+                                print(Fore.GREEN + f"   💰 Token balance: {balance:,.2f}")
+                            return balance
+                        except:
+                            continue
+            return 0
+        except Exception as e:
+            if not silent:
+                print(Fore.RED + f"   ⚠️ Token balance check error: {e}")
+            return 0
+
+    async def get_sol_price(self) -> float:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(f"https://api.dexscreener.com/latest/dex/tokens/{SOL_MINT}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    pairs = data.get("pairs", [])
+                    if pairs:
+                        return float(pairs[0].get("priceUsd", 0))
+        except:
+            pass
+        return 150.0
+
+    def _is_recently_bought(self, token_mint: str, cooldown_seconds: int = 30) -> bool:
+        """Check if we recently tried to buy this token (prevents double-buys)"""
+        if token_mint in self.recent_buys:
+            elapsed = time.time() - self.recent_buys[token_mint]
+            if elapsed < cooldown_seconds:
+                print(Fore.YELLOW + f"⚠️ Recently bought {token_mint[:20]}... ({elapsed:.0f}s ago), skipping")
+                return True
+        return False
+
+    def _mark_buy_attempted(self, token_mint: str):
+        """Mark that we attempted to buy this token"""
+        self.recent_buys[token_mint] = time.time()
+
+    async def buy_token(self, token_mint: str, amount_usd: float) -> TradeResult:
+        """Buy token with double-buy protection"""
+        try:
+            # ═══════════════════════════════════════════════════════════════
+            # NEW: Check if we recently tried to buy this token
+            # ═══════════════════════════════════════════════════════════════
+            if self._is_recently_bought(token_mint, cooldown_seconds=60):
+                return TradeResult(success=False, error="Recently attempted buy, waiting...")
+
+            # Check if we already have tokens (maybe previous buy succeeded)
+            # Ignore dust amounts - memecoins typically give millions of tokens, so < 100 is dust
+            existing_balance = self.get_token_balance(token_mint, silent=True)
+            if existing_balance > 100:  # More than 100 tokens = real position, not dust
+                print(Fore.YELLOW + f"⚠️ Already holding {existing_balance:,.0f} tokens of {token_mint[:20]}...")
+                return TradeResult(success=False, error="Already holding this token")
+
+            sol_price = await self.get_sol_price()
+            if sol_price <= 0:
+                return TradeResult(success=False, error="Could not get SOL price")
+
+            sol_amount = amount_usd / sol_price
+            balance_before = self.get_sol_balance()
+
+            if balance_before < sol_amount + MIN_SOL_KEEP:
+                return TradeResult(
+                    success=False,
+                    error=f"Insufficient SOL. Have: {balance_before:.4f}, Need: {sol_amount + MIN_SOL_KEEP:.4f}"
+                )
+
+            lamports = int(sol_amount * 1e9)
+            print(Fore.YELLOW + f"🔄 Buying ${amount_usd:.2f} ({sol_amount:.4f} SOL)...")
+
+            # Mark that we're attempting this buy NOW (before sending tx)
+            self._mark_buy_attempted(token_mint)
+
+            # Try Jupiter (more reliable than PumpPortal for most tokens)
+            result = await self._jupiter_swap_safe(SOL_MINT, token_mint, lamports, is_buy=True)
+
+            # If Jupiter fails, try PumpPortal as fallback
+            if not result.success and "NO_ROUTE" in (result.error or ""):
+                print(Fore.YELLOW + f"   Jupiter no route, trying PumpPortal...")
+                result = await self._pumpfun_swap_safe(token_mint, sol_amount, is_buy=True)
+
+            # Calculate fee (SOL spent beyond the swap amount)
+            if result.success:
+                balance_after = self.get_sol_balance()
+                sol_spent = balance_before - balance_after
+                fee_sol = sol_spent - sol_amount  # Fee = total spent - swap amount
+                if fee_sol < 0:
+                    fee_sol = 0.002  # Estimate if calculation is off
+                result.fee_sol = fee_sol
+                print(Fore.CYAN + f"   💸 Fee: {fee_sol:.6f} SOL (${fee_sol * sol_price:.4f})")
+
+            return result
+        except Exception as e:
+            return TradeResult(success=False, error=str(e))
+
+    async def sell_token(self, token_mint: str, sell_all: bool = True) -> TradeResult:
+        """Sell token safely"""
+        try:
+            amount_tokens = self.get_token_balance(token_mint)
+            if amount_tokens <= 0:
+                return TradeResult(success=False, error="No tokens to sell")
+
+            decimals = await self._get_token_decimals(token_mint)
+            amount_raw = int(amount_tokens * (10 ** decimals))
+
+            # Track SOL balance before sell to calculate fees
+            balance_before = self.get_sol_balance()
+
+            print(Fore.YELLOW + f"🔄 Selling {amount_tokens:,.0f} tokens...")
+
+            # Try Jupiter first
+            result = await self._jupiter_swap_safe(token_mint, SOL_MINT, amount_raw, is_buy=False)
+
+            if not result.success and "NO_ROUTE" in (result.error or ""):
+                print(Fore.YELLOW + f"   Jupiter no route, trying PumpPortal...")
+                result = await self._pumpfun_swap_safe(token_mint, 0, is_buy=False)
+
+            # Calculate fee for sells
+            if result.success and result.amount_out > 0:
+                balance_after = self.get_sol_balance()
+                sol_received = balance_after - balance_before
+                # Fee = expected SOL - actual SOL received (includes priority fee)
+                expected_sol = result.amount_out
+                fee_sol = expected_sol - sol_received if expected_sol > sol_received else 0.002
+                if fee_sol < 0:
+                    fee_sol = 0.002  # Minimum estimate
+                result.fee_sol = fee_sol
+                sol_price = await self.get_sol_price()
+                print(Fore.CYAN + f"   💸 Fee: {fee_sol:.6f} SOL (${fee_sol * sol_price:.4f})")
+
+            return result
+        except Exception as e:
+            return TradeResult(success=False, error=str(e))
+
+    async def _jupiter_swap_safe(self, input_mint: str, output_mint: str, amount: int, is_buy: bool) -> TradeResult:
+        """
+        COMPLETELY REWRITTEN - Checks token balance during wait, NEVER retries
+        """
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Step 1: Get quote - use higher slippage for sells
+            slippage = SLIPPAGE_BPS if is_buy else SELL_SLIPPAGE_BPS
+            quote_params = {
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": amount,
+                "slippageBps": slippage
+            }
+
+            try:
+                quote_resp = await client.get(JUPITER_QUOTE_API, params=quote_params)
+            except Exception as e:
+                return TradeResult(success=False, error=f"Quote request failed: {e}")
+
+            if quote_resp.status_code != 200:
+                return TradeResult(success=False, error=f"Quote failed: {quote_resp.text}")
+
+            quote_data = quote_resp.json()
+
+            if "error" in quote_data:
+                error_msg = str(quote_data.get('error', ''))
+                if "No route found" in error_msg or "ROUTE" in error_msg.upper():
+                    return TradeResult(success=False, error="NO_ROUTE")
+                return TradeResult(success=False, error=f"Quote error: {error_msg}")
+
+            # Step 2: Get swap transaction
+            swap_body = {
+                "quoteResponse": quote_data,
+                "userPublicKey": str(self.pubkey),
+                "wrapAndUnwrapSol": True,
+                "dynamicComputeUnitLimit": True,
+                "dynamicSlippage": True,
+                "prioritizationFeeLamports": {
+                    "priorityLevelWithMaxLamports": {
+                        "maxLamports": 200000,
+                        "priorityLevel": "high"
+                    }
+                }
+            }
+
+            try:
+                swap_resp = await client.post(JUPITER_SWAP_API, json=swap_body)
+            except Exception as e:
+                return TradeResult(success=False, error=f"Swap request failed: {e}")
+
+            if swap_resp.status_code != 200:
+                return TradeResult(success=False, error=f"Swap failed: {swap_resp.text}")
+
+            swap_data = swap_resp.json()
+
+            if "error" in swap_data:
+                return TradeResult(success=False, error=f"Swap error: {swap_data['error']}")
+
+            tx_b64 = swap_data.get("swapTransaction")
+            if not tx_b64:
+                return TradeResult(success=False, error="No swapTransaction in response")
+
+            # ═══════════════════════════════════════════════════════════════
+            # SEND TX ONCE - Check balance during wait - NEVER RETRY
+            # ═══════════════════════════════════════════════════════════════
+            import base64
+
+            try:
+                # Decode and sign transaction
+                tx_bytes = base64.b64decode(tx_b64)
+                transaction = VersionedTransaction.from_bytes(tx_bytes)
+                signed_tx = VersionedTransaction(transaction.message, [self.keypair])
+
+                # Record initial balances
+                initial_token_balance = 0
+                if is_buy:
+                    initial_token_balance = self.get_token_balance(output_mint, silent=True)
+                else:
+                    # For sells, record how many tokens we have now
+                    initial_token_balance = self.get_token_balance(input_mint, silent=True)
+
+                # Send transaction ONCE
+                from solana.rpc.types import TxOpts
+                tx_resp = self.client.send_transaction(
+                    signed_tx,
+                    TxOpts(skip_preflight=True, max_retries=3)
+                )
+                tx_hash = str(tx_resp.value)
+                print(Fore.CYAN + f"📤 TX sent: {tx_hash[:40]}...")
+
+                # ═══════════════════════════════════════════════════════════
+                # SMART WAIT: Check balance changes
+                # For buys: check if tokens arrived
+                # For sells: check if tokens left (SOL arrived)
+                # ═══════════════════════════════════════════════════════════
+                print(
+                    Fore.YELLOW + f"⏳ Watching for {'tokens' if is_buy else 'sale completion'} (up to {TX_TIMEOUT}s)...")
+
+                start_time = time.time()
+                check_count = 0
+                initial_sol_balance = self.get_sol_balance() if not is_buy else 0
+
+                while time.time() - start_time < TX_TIMEOUT:
+                    check_count += 1
+
+                    if is_buy:
+                        # For BUYS: check if tokens arrived
+                        current_balance = self.get_token_balance(output_mint, silent=True)
+                        if current_balance > initial_token_balance:
+                            tokens_received = current_balance - initial_token_balance
+                            print(Fore.GREEN + f"✅ TOKENS ARRIVED! Got {tokens_received:,.0f} tokens")
+                            in_amt = float(quote_data.get("inAmount", amount)) / 1e9
+                            return TradeResult(
+                                success=True,
+                                tx_hash=tx_hash,
+                                amount_in=in_amt,
+                                amount_out=tokens_received
+                            )
+                    else:
+                        # For SELLS: check if tokens are GONE (meaning sale succeeded)
+                        current_token_balance = self.get_token_balance(input_mint, silent=True)
+                        if current_token_balance < initial_token_balance * 0.01:  # 99% sold
+                            current_sol = self.get_sol_balance()
+                            sol_received = current_sol - initial_sol_balance
+                            print(Fore.GREEN + f"✅ SELL COMPLETE! Tokens sold, got {sol_received:.4f} SOL")
+                            return TradeResult(
+                                success=True,
+                                tx_hash=tx_hash,
+                                amount_in=initial_token_balance,
+                                amount_out=sol_received
+                            )
+
+                    # Progress indicator every 5 seconds
+                    if check_count % 10 == 0:
+                        elapsed = int(time.time() - start_time)
+                        print(Fore.YELLOW + f"   Watching... ({elapsed}s)")
+
+                    await asyncio.sleep(TX_CONFIRM_SLEEP)
+
+                # ═══════════════════════════════════════════════════════════
+                # TIMEOUT: Do one final balance check
+                # ═══════════════════════════════════════════════════════════
+                print(Fore.YELLOW + f"⏰ Timeout - final balance check...")
+
+                if is_buy:
+                    final_balance = self.get_token_balance(output_mint)
+                    if final_balance > initial_token_balance:
+                        tokens_received = final_balance - initial_token_balance
+                        print(Fore.GREEN + f"✅ TOKENS FOUND! Got {tokens_received:,.0f} tokens")
+                        in_amt = float(quote_data.get("inAmount", amount)) / 1e9
+                        return TradeResult(
+                            success=True,
+                            tx_hash=tx_hash,
+                            amount_in=in_amt,
+                            amount_out=tokens_received
+                        )
+                else:
+                    # Final sell check - if tokens are gone, sale worked
+                    final_token_balance = self.get_token_balance(input_mint)
+                    if final_token_balance < initial_token_balance * 0.01:
+                        final_sol = self.get_sol_balance()
+                        sol_received = final_sol - initial_sol_balance
+                        print(Fore.GREEN + f"✅ SELL COMPLETE! Got {sol_received:.4f} SOL")
+                        return TradeResult(
+                            success=True,
+                            tx_hash=tx_hash,
+                            amount_in=initial_token_balance,
+                            amount_out=sol_received
+                        )
+
+                # Really failed
+                if is_buy:
+                    print(Fore.RED + f"❌ No tokens received after {TX_TIMEOUT}s")
+                else:
+                    print(Fore.RED + f"❌ Sell may have failed - tokens still in wallet")
+                print(Fore.YELLOW + f"   Check TX: https://solscan.io/tx/{tx_hash}")
+                return TradeResult(
+                    success=False,
+                    tx_hash=tx_hash,
+                    error="TX_TIMEOUT"
+                )
+
+            except Exception as e:
+                return TradeResult(success=False, error=f"Transaction error: {str(e)}")
+
+    async def _pumpfun_swap_safe(self, token_mint: str, amount_sol: float, is_buy: bool) -> TradeResult:
+        """PumpPortal swap - also uses balance checking instead of confirmation"""
+        async with httpx.AsyncClient(timeout=30) as client:
+            if is_buy:
+                trade_body = {
+                    "publicKey": str(self.pubkey),
+                    "action": "buy",
+                    "mint": token_mint,
+                    "amount": amount_sol,
+                    "denominatedInSol": "true",
+                    "slippage": SLIPPAGE_BPS / 100,
+                    "priorityFee": 0.002,  # Higher priority for faster execution
+                    "pool": "auto"
+                }
+            else:
+                trade_body = {
+                    "publicKey": str(self.pubkey),
+                    "action": "sell",
+                    "mint": token_mint,
+                    "amount": "100%",
+                    "denominatedInSol": "false",
+                    "slippage": SELL_SLIPPAGE_BPS / 100,  # Higher slippage for sells
+                    "priorityFee": 0.003,  # Even higher priority to get out fast
+                    "pool": "auto"
+                }
+
+            try:
+                trade_resp = await client.post(PUMPPORTAL_API, data=trade_body)
+            except Exception as e:
+                return TradeResult(success=False, error=f"PumpPortal request failed: {e}")
+
+            if trade_resp.status_code != 200:
+                if "route" in trade_resp.text.lower():
+                    return TradeResult(success=False, error="NO_ROUTE")
+                return TradeResult(success=False, error=f"PumpPortal error: {trade_resp.text}")
+
+            tx_bytes = trade_resp.content
+
+            if not tx_bytes or len(tx_bytes) < 100:
+                return TradeResult(success=False, error="Invalid transaction response")
+
+            try:
+                transaction = VersionedTransaction.from_bytes(tx_bytes)
+                signed_tx = VersionedTransaction(transaction.message, [self.keypair])
+
+                # Record initial balance
+                initial_balance = 0
+                initial_sol = 0
+                if is_buy:
+                    initial_balance = self.get_token_balance(token_mint, silent=True)
+                else:
+                    # For sells, track token balance and SOL
+                    initial_balance = self.get_token_balance(token_mint, silent=True)
+                    initial_sol = self.get_sol_balance()
+
+                from solana.rpc.types import TxOpts
+                tx_resp = self.client.send_transaction(
+                    signed_tx,
+                    TxOpts(skip_preflight=True, max_retries=3)
+                )
+                tx_hash = str(tx_resp.value)
+                print(Fore.CYAN + f"📤 TX sent via PumpPortal: {tx_hash[:40]}...")
+
+                # Watch for completion
+                print(Fore.YELLOW + f"⏳ Watching for {'tokens' if is_buy else 'sale'}...")
+
+                start_time = time.time()
+                while time.time() - start_time < TX_TIMEOUT:
+                    if is_buy:
+                        current_balance = self.get_token_balance(token_mint, silent=True)
+                        if current_balance > initial_balance:
+                            tokens_received = current_balance - initial_balance
+                            print(Fore.GREEN + f"✅ TOKENS ARRIVED! Got {tokens_received:,.0f}")
+                            return TradeResult(
+                                success=True,
+                                tx_hash=tx_hash,
+                                amount_in=amount_sol,
+                                amount_out=tokens_received
+                            )
+                    else:
+                        # For sells, check if tokens are gone
+                        current_balance = self.get_token_balance(token_mint, silent=True)
+                        if current_balance < initial_balance * 0.01:  # 99% sold
+                            current_sol = self.get_sol_balance()
+                            sol_received = current_sol - initial_sol
+                            print(Fore.GREEN + f"✅ SELL COMPLETE! Got {sol_received:.4f} SOL")
+                            return TradeResult(
+                                success=True,
+                                tx_hash=tx_hash,
+                                amount_in=initial_balance,
+                                amount_out=sol_received
+                            )
+                    await asyncio.sleep(TX_CONFIRM_SLEEP)
+
+                # Final check
+                if is_buy:
+                    final_balance = self.get_token_balance(token_mint)
+                    if final_balance > initial_balance:
+                        return TradeResult(
+                            success=True,
+                            tx_hash=tx_hash,
+                            amount_in=amount_sol,
+                            amount_out=final_balance - initial_balance
+                        )
+                else:
+                    final_balance = self.get_token_balance(token_mint)
+                    if final_balance < initial_balance * 0.01:
+                        final_sol = self.get_sol_balance()
+                        return TradeResult(
+                            success=True,
+                            tx_hash=tx_hash,
+                            amount_in=initial_balance,
+                            amount_out=final_sol - initial_sol
+                        )
+
+                return TradeResult(
+                    success=False,
+                    tx_hash=tx_hash,
+                    error="TX_TIMEOUT"
+                )
+
+            except Exception as e:
+                return TradeResult(success=False, error=str(e))
+
+    async def _confirm_tx_safe(self, tx_hash: str) -> bool:
+        """
+        FIXED: Better confirmation logic with longer timeout
+        """
+        from solders.signature import Signature
+
+        start = time.time()
+        checks = 0
+
+        # Convert string to Signature object
+        try:
+            sig = Signature.from_string(tx_hash)
+        except Exception as e:
+            print(Fore.RED + f"Invalid signature format: {e}")
+            return False
+
+        while time.time() - start < TX_TIMEOUT:
+            checks += 1
+            try:
+                resp = self.client.get_signature_statuses([sig])
+                if resp.value and resp.value[0]:
+                    status = resp.value[0]
+
+                    # Check for actual failure
+                    if status.err:
+                        print(Fore.RED + f"❌ TX failed: {status.err}")
+                        return False
+
+                    # Check for success
+                    if status.confirmation_status in ["confirmed", "finalized"]:
+                        return True
+
+                    # Still processing
+                    if checks % 5 == 0:
+                        print(Fore.YELLOW + f"   Still waiting... ({int(time.time() - start)}s)")
+
+                await asyncio.sleep(TX_CONFIRM_SLEEP)
+
+            except Exception as e:
+                if checks % 10 == 0:
+                    print(Fore.YELLOW + f"   Confirmation check error: {e}")
+                await asyncio.sleep(TX_CONFIRM_SLEEP)
+
+        return False
+
+    async def _get_token_decimals(self, mint: str) -> int:
+        try:
+            mint_pubkey = Pubkey.from_string(mint)
+            resp = self.client.get_account_info_json_parsed(mint_pubkey)
+            if resp.value:
+                data = resp.value.data.parsed
+                if 'info' in data:
+                    return data['info'].get('decimals', 9)
+        except:
+            pass
+        return 9
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TOKEN AND POSITION DATA CLASSES
+# ═══════════════════════════════════════════════════════════════════════════════
+@dataclass
+class Token:
+    symbol: str
+    name: str
+    chain: str
+    contract: str
+    pair_address: str
+    price: float
+    market_cap: float = 0
+    liquidity: float = 0
+    volume_5m: float = 0
+    volume_1h: float = 0
+    volume_24h: float = 0
+    change_5m: float = 0
+    change_1h: float = 0
+    change_24h: float = 0
+    buys_5m: int = 0
+    sells_5m: int = 0
+    buys_1h: int = 0
+    sells_1h: int = 0
+    age_minutes: float = 9999
+    volume_spike: float = 0
+    buy_pressure: float = 0
+    buys_per_minute: float = 0
+    avg_buy_size: float = 0
+    is_new_token: bool = False
+    is_volume_spike: bool = False
+    is_whale_accumulating: bool = False
+    is_coordinated_buy: bool = False
+    insider_score: float = 0
+    pump_score: float = 0
+    discovered_at: float = field(default_factory=time.time)
+    first_seen_price: float = 0
+    dex_url: str = ''
+    dex_id: str = ''
+    alert_reasons: list = field(default_factory=list)
+
+    def get_chart_url(self) -> str:
+        if self.dex_url:
+            return self.dex_url
+        return f"https://dexscreener.com/{self.chain}/{self.pair_address}"
+
+    def get_unique_id(self) -> str:
+        return f"{self.chain}_{self.pair_address}"
+
+    def get_total_score(self) -> float:
+        return self.pump_score + self.insider_score
+
+
+@dataclass
+class Position:
+    symbol: str
+    chain: str
+    contract: str
+    pair_address: str
+    entry_price: float
+    current_price: float
+    amount_usd: float
+    tokens_held: float
+    entry_time: float
+    pnl_usd: float = 0
+    pnl_percent: float = 0
+    status: str = 'open'
+    dex_url: str = ''
+    unique_id: str = ''
+    insider_score_at_entry: float = 0
+    alert_reasons: list = field(default_factory=list)
+    highest_price: float = 0
+    fetch_failures: int = 0
+    entry_liquidity: float = 0
+    last_liquidity: float = 0
+    highest_liquidity: float = 0
+    last_price: float = 0
+    last_buy_ratio: float = 0.5
+    rug_warnings: int = 0
+    tx_hash: str = ''  # NEW: Store transaction hash for reference
+
+    def get_chart_url(self) -> str:
+        return self.dex_url or f"https://dexscreener.com/{self.chain}/{self.pair_address}"
+
+    def get_hold_time_minutes(self) -> float:
+        return (time.time() - self.entry_time) / 60
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INSIDER DETECTOR
+# ═══════════════════════════════════════════════════════════════════════════════
+class InsiderDetector:
+    def __init__(self):
+        self.token_history: dict[str, list] = {}
+        self.alerts: list[dict] = []
+
+    def analyze_token(self, token: Token, pair_data: dict) -> dict:
+        signals = {
+            'is_new': False,
+            'volume_spike': False,
+            'whale_buy': False,
+            'coordinated': False,
+            'reasons': [],
+            'score': 0
+        }
+
+        # 1. NEW TOKEN
+        if token.age_minutes < 10:
+            signals['is_new'] = True
+            signals['score'] += 50
+            signals['reasons'].append(f"🆕 {token.age_minutes:.0f}m old!")
+        elif token.age_minutes < 30:
+            signals['is_new'] = True
+            signals['score'] += 35
+            signals['reasons'].append(f"🆕 {token.age_minutes:.0f}m old")
+        elif token.age_minutes < 60:
+            signals['is_new'] = True
+            signals['score'] += 20
+            signals['reasons'].append(f"⏰ {token.age_minutes:.0f}m old")
+        elif token.age_minutes < 120:
+            signals['score'] += 10
+
+        # 2. PRICE PUMPING
+        if token.change_5m >= 50:
+            signals['score'] += 50
+            signals['reasons'].append(f"🚀 +{token.change_5m:.0f}% PUMP!")
+        elif token.change_5m >= 20:
+            signals['score'] += 35
+            signals['reasons'].append(f"🚀 +{token.change_5m:.0f}%")
+        elif token.change_5m >= 10:
+            signals['score'] += 25
+            signals['reasons'].append(f"📈 +{token.change_5m:.0f}%")
+        elif token.change_5m >= 5:
+            signals['score'] += 15
+            signals['reasons'].append(f"📈 +{token.change_5m:.0f}%")
+        elif token.change_5m >= 2:
+            signals['score'] += 8
+
+        # 3. VOLUME SPIKE
+        if token.volume_1h > 0:
+            avg_5m = token.volume_1h / 12
+            if avg_5m > 0 and token.volume_5m > 0:
+                spike = token.volume_5m / avg_5m
+                token.volume_spike = spike
+                if spike >= 10:
+                    signals['volume_spike'] = True
+                    signals['score'] += 55
+                    signals['reasons'].append(f"💥 {spike:.0f}x VOLUME!")
+                elif spike >= 5:
+                    signals['volume_spike'] = True
+                    signals['score'] += 30
+                    signals['reasons'].append(f"📊 {spike:.0f}x vol")
+                elif spike >= 3:
+                    signals['score'] += 15
+                    signals['reasons'].append(f"📊 {spike:.1f}x vol")
+
+        # 4. BUY PRESSURE
+        total_txns = token.buys_5m + token.sells_5m
+        if total_txns > 0:
+            buy_ratio = token.buys_5m / total_txns
+            token.buy_pressure = buy_ratio
+            if buy_ratio >= 0.85:
+                signals['score'] += 40
+                signals['reasons'].append(f"🟢 {buy_ratio * 100:.0f}% BUYS!")
+            elif buy_ratio >= 0.75:
+                signals['score'] += 30
+                signals['reasons'].append(f"🟢 {buy_ratio * 100:.0f}% buys")
+            elif buy_ratio >= 0.65:
+                signals['score'] += 20
+                signals['reasons'].append(f"🟢 {buy_ratio * 100:.0f}% buys")
+            elif buy_ratio >= 0.55:
+                signals['score'] += 10
+
+        # 5. BUY FREQUENCY
+        if token.buys_5m > 0:
+            buys_per_min = token.buys_5m / 5
+            token.buys_per_minute = buys_per_min
+            if buys_per_min >= 10:
+                signals['score'] += 35
+                signals['reasons'].append(f"⚡ {buys_per_min:.0f}/min!")
+            elif buys_per_min >= 5:
+                signals['score'] += 25
+                signals['reasons'].append(f"⚡ {buys_per_min:.0f}/min")
+            elif buys_per_min >= 2:
+                signals['score'] += 15
+                signals['reasons'].append(f"⚡ {buys_per_min:.1f}/min")
+
+        # 6. WHALE DETECTION
+        if token.volume_5m > 0 and token.buys_5m > 0:
+            avg_buy = token.volume_5m / token.buys_5m
+            token.avg_buy_size = avg_buy
+            if avg_buy >= 5000:
+                signals['whale_buy'] = True
+                signals['score'] += 45
+                signals['reasons'].append(f"🐋 ${avg_buy:,.0f} avg!")
+            elif avg_buy >= 2000:
+                signals['whale_buy'] = True
+                signals['score'] += 30
+                signals['reasons'].append(f"🐋 ${avg_buy:,.0f} avg")
+            elif avg_buy >= 1000:
+                signals['score'] += 20
+                signals['reasons'].append(f"🐋 ${avg_buy:,.0f}")
+            elif avg_buy >= 500:
+                signals['score'] += 10
+
+        # 7. COORDINATED BUYING
+        if token.buys_5m >= 20 and token.buy_pressure >= 0.7:
+            signals['coordinated'] = True
+            signals['score'] += 35
+            signals['reasons'].append(f"🎯 COORDINATED!")
+        elif token.buys_5m >= 15 and token.buy_pressure >= 0.65:
+            signals['coordinated'] = True
+            signals['score'] += 25
+            signals['reasons'].append(f"🎯 Coordinated")
+        elif token.buys_5m >= 10 and token.buy_pressure >= 0.6:
+            signals['score'] += 15
+
+        # 8. MOMENTUM COMBO
+        if token.change_5m > 5 and token.change_1h > 10:
+            signals['score'] += 20
+            signals['reasons'].append("📈📈 Momentum")
+
+        # 9. LIQUIDITY SWEET SPOT
+        if 5000 <= token.liquidity <= 50000:
+            signals['score'] += 10
+
+        return signals
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN BOT CLASS - WITH FIXES
+# ═══════════════════════════════════════════════════════════════════════════════
+class PumpSniper:
+    def __init__(self):
+        self.print_banner()
+
+        self.balance = INITIAL_BALANCE
+        self.initial_balance = max(INITIAL_BALANCE, 1.0)  # Never zero to prevent division errors
+        self.positions: list[Position] = []
+        self.closed_trades: list[Position] = []
+        self.all_tokens: dict[str, Token] = {}
+        self.hot_tokens: dict[str, Token] = {}
+        self.recently_traded: dict[str, float] = {}
+        self.dead_tokens: set[str] = set()
+
+        self.insider = InsiderDetector()
+
+        # ═══════════════════════════════════════════════════════════════════
+        # NEW: Track pending buys to prevent double-execution
+        # ═══════════════════════════════════════════════════════════════════
+        self.pending_buys: dict[str, float] = {}  # unique_id -> timestamp
+
+        # Real trading initialization
+        self.real_trader = None
+        if not PAPER_TRADE:
+            if not REAL_TRADING_AVAILABLE:
+                print(Fore.RED + "❌ Real trading packages not installed!")
+                print(Fore.YELLOW + "Run: pip install solana solders httpx base58 --break-system-packages")
+                print(Fore.YELLOW + "Falling back to paper trading...")
+            else:
+                try:
+                    self.real_trader = SolanaTrader()
+                    # Get real balance
+                    sol_balance = self.real_trader.get_sol_balance()
+
+                    # Get SOL price (sync version to avoid asyncio issues in init)
+                    try:
+                        import requests
+                        r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{SOL_MINT}", timeout=10)
+                        if r.status_code == 200:
+                            data = r.json()
+                            pairs = data.get("pairs", [])
+                            if pairs:
+                                sol_price = float(pairs[0].get("priceUsd", 150))
+                            else:
+                                sol_price = 150.0
+                        else:
+                            sol_price = 150.0
+                    except:
+                        sol_price = 150.0
+
+                    self.balance = sol_balance * sol_price
+                    self.initial_balance = max(self.balance, 1.0)  # Prevent division by zero
+                    print(
+                        Fore.GREEN + f"💰 Real Balance: ${self.balance:,.2f} ({sol_balance:.4f} SOL @ ${sol_price:.2f})")
+                except Exception as e:
+                    print(Fore.RED + f"❌ Real trading init failed: {e}")
+                    print(Fore.YELLOW + "Falling back to paper trading...")
+                    self.real_trader = None
+                    self.balance = INITIAL_BALANCE
+                    self.initial_balance = INITIAL_BALANCE
+
+        self.stats = {
+            'total_scanned': 0,
+            'insider_signals': 0,
+            'new_tokens_found': 0,
+            'volume_spikes_found': 0,
+            'whale_buys_found': 0,
+            'trades_executed': 0,
+            'profitable_trades': 0,
+            'losing_trades': 0,
+            'total_profit': 0,
+            'total_loss': 0,
+            'best_trade': 0,
+            'worst_trade': 0,
+            'last_scan': None,
+            'api_calls': 0,
+            'last_price_update': None,
+            'win_streak': 0,
+            'current_streak': 0,
+            'tokens_delisted': 0,
+            'api_errors': 0,
+            'rugs_avoided': 0,
+            'double_buys_prevented': 0,
+            'total_fees_sol': 0,  # Track fees in SOL
+            'total_fees_usd': 0,  # Track fees in USD
+            'buy_count': 0,
+            'sell_count': 0
+        }
+
+        self.running = True
+        self.auto_trade = True
+        self.scanning = False
+
+        self.load_state()
+
+        mode = "🔴 REAL MONEY" if (not PAPER_TRADE and self.real_trader) else "📝 PAPER TRADING"
+        print(Fore.GREEN + f"✓ {mode} MODE ACTIVATED")
+        print(Fore.MAGENTA + "🛡️ RUG PULL PROTECTION ENABLED")
+        print(Fore.CYAN + "🔒 DOUBLE-BUY PROTECTION ENABLED")
+        print(Fore.YELLOW + f"💰 Balance: ${self.balance:,.2f}")
+        print(Fore.RED + f"⚡ Speed: {SCAN_INTERVAL}s scans | {PRICE_UPDATE_INTERVAL}s updates")
+        print(
+            Fore.RED + f"🎯 Targets: +{TAKE_PROFIT_PERCENT}% TP | -{STOP_LOSS_PERCENT}% SL | {TRAILING_STOP_PERCENT}% Trail")
+        print()
+
+    def print_banner(self):
+        print()
+        print(Fore.RED + Style.BRIGHT + "╔" + "═" * 74 + "╗")
+        print(Fore.RED + Style.BRIGHT + "║" + " " * 74 + "║")
+        mode_text = "REAL MONEY MODE" if not PAPER_TRADE else "PAPER TRADING"
+        print(Fore.RED + Style.BRIGHT + "║" + f"{'🚀 PUMP SNIPER v8.6 - BALANCE CHECK 🚀':^74}" + "║")
+        print(Fore.RED + Style.BRIGHT + "║" + f"{mode_text:^74}" + "║")
+        print(Fore.RED + Style.BRIGHT + "║" + " " * 74 + "║")
+        print(Fore.MAGENTA + Style.BRIGHT + "║" + f"{'🛡️ RUG + DOUBLE-BUY PROTECTION 🛡️':^74}" + "║")
+        print(Fore.RED + Style.BRIGHT + "║" + " " * 74 + "║")
+        print(Fore.RED + Style.BRIGHT + "╚" + "═" * 74 + "╝")
+        print(Fore.YELLOW + f"⏰ {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print()
+
+    def load_state(self):
+        try:
+            if os.path.exists(PORTFOLIO_FILE):
+                with open(PORTFOLIO_FILE, 'r') as f:
+                    data = json.load(f)
+                    # Only load saved balance in paper trading mode
+                    if PAPER_TRADE:
+                        self.balance = data.get('balance', INITIAL_BALANCE)
+                        self.initial_balance = max(self.balance, 1.0)
+                    # In real mode, we already got balance from wallet - don't override
+
+                    saved_stats = data.get('stats', {})
+                    for k, v in saved_stats.items():
+                        if k in self.stats:
+                            self.stats[k] = v
+
+                    for pos_data in data.get('positions', []):
+                        for field in ['alert_reasons', 'highest_price', 'tokens_held', 'contract',
+                                      'fetch_failures', 'entry_liquidity', 'last_liquidity',
+                                      'highest_liquidity', 'last_price', 'last_buy_ratio', 'rug_warnings', 'tx_hash']:
+                            if field not in pos_data:
+                                if field == 'alert_reasons':
+                                    pos_data[field] = []
+                                elif field in ['highest_price', 'last_price']:
+                                    pos_data[field] = pos_data.get('entry_price', 0)
+                                elif field == 'last_buy_ratio':
+                                    pos_data[field] = 0.5
+                                elif field == 'tx_hash':
+                                    pos_data[field] = ''
+                                else:
+                                    pos_data[field] = 0
+                        self.positions.append(Position(**pos_data))
+
+                    self.recently_traded = data.get('recently_traded', {})
+                    self.dead_tokens = set(data.get('dead_tokens', []))
+                    print(Fore.GREEN + f"✓ Loaded - Balance: ${self.balance:,.2f} | Positions: {len(self.positions)}")
+        except Exception as e:
+            print(Fore.YELLOW + f"Starting fresh: {e}")
+
+        try:
+            if os.path.exists(TRADE_LOG_FILE):
+                with open(TRADE_LOG_FILE, 'r') as f:
+                    trades = json.load(f)
+                    for t in trades:
+                        for field in ['alert_reasons', 'highest_price', 'tokens_held', 'contract',
+                                      'fetch_failures', 'entry_liquidity', 'last_liquidity',
+                                      'highest_liquidity', 'last_price', 'last_buy_ratio', 'rug_warnings', 'tx_hash']:
+                            if field not in t:
+                                if field == 'alert_reasons':
+                                    t[field] = []
+                                elif field == 'tx_hash':
+                                    t[field] = ''
+                                else:
+                                    t[field] = 0
+                        self.closed_trades.append(Position(**t))
+                    print(Fore.GREEN + f"✓ Loaded {len(self.closed_trades)} trade history")
+        except:
+            pass
+
+    def save_state(self):
+        try:
+            with open(PORTFOLIO_FILE, 'w') as f:
+                json.dump({
+                    'balance': self.balance,
+                    'stats': self.stats,
+                    'positions': [vars(p) for p in self.positions],
+                    'recently_traded': self.recently_traded,
+                    'dead_tokens': list(self.dead_tokens)
+                }, f, indent=2, default=list)
+
+            with open(TRADE_LOG_FILE, 'w') as f:
+                json.dump([vars(t) for t in self.closed_trades], f, indent=2, default=list)
+        except Exception as e:
+            print(Fore.RED + f"Save error: {e}")
+
+    def is_on_cooldown(self, pair_id: str) -> bool:
+        if pair_id in self.recently_traded:
+            if time.time() - self.recently_traded[pair_id] < COOLDOWN_AFTER_TRADE:
+                return True
+            del self.recently_traded[pair_id]
+        return False
+
+    def add_to_cooldown(self, pair_id: str):
+        self.recently_traded[pair_id] = time.time()
+
+    def is_holding(self, pair_id: str) -> bool:
+        return any(p.unique_id == pair_id for p in self.positions)
+
+    def is_pending_buy(self, pair_id: str) -> bool:
+        """NEW: Check if we have a pending buy for this token"""
+        if pair_id in self.pending_buys:
+            elapsed = time.time() - self.pending_buys[pair_id]
+            if elapsed < 120:  # 2 minute pending window
+                return True
+            del self.pending_buys[pair_id]
+        return False
+
+    def is_token_dead(self, pair_id: str) -> bool:
+        return pair_id in self.dead_tokens
+
+    def mark_token_dead(self, pair_id: str, reason: str = ""):
+        self.dead_tokens.add(pair_id)
+        self.stats['tokens_delisted'] += 1
+        if pair_id in self.hot_tokens:
+            del self.hot_tokens[pair_id]
+        if pair_id in self.all_tokens:
+            del self.all_tokens[pair_id]
+        if reason:
+            print(Fore.RED + f"☠️ Marked dead: {pair_id[:20]}... - {reason}")
+
+    def check_pair_status(self, chain: str, pair_address: str) -> tuple[str, dict | None]:
+        try:
+            self.stats['api_calls'] += 1
+            r = requests.get(
+                f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_address}",
+                timeout=8
+            )
+            if r.status_code == 404:
+                return 'dead', None
+            if r.status_code == 429:
+                time.sleep(5)
+                return 'error', None
+            if r.status_code == 200:
+                data = r.json()
+                pair = data.get('pair')
+                if not pair and isinstance(data.get('pairs'), list) and len(data['pairs']) > 0:
+                    pair = data['pairs'][0]
+                if not pair:
+                    return 'dead', None
+                price = float(pair.get('priceUsd', 0) or 0)
+                liq = pair.get('liquidity', {})
+                liq_usd = float(liq.get('usd', 0) or 0) if isinstance(liq, dict) else 0
+                if price <= 0 and liq_usd < MIN_ALIVE_LIQUIDITY:
+                    return 'dead', pair
+                return 'active', pair
+            self.stats['api_errors'] += 1
+            return 'error', None
+        except requests.exceptions.Timeout:
+            return 'error', None
+        except Exception:
+            self.stats['api_errors'] += 1
+            return 'error', None
+
+    def check_rug_pull(self, pos: Position, pair: dict) -> tuple[bool, str]:
+        if not pair:
+            return False, ""
+
+        liq = pair.get('liquidity', {})
+        current_liq = float(liq.get('usd', 0) or 0) if isinstance(liq, dict) else 0
+        current_price = float(pair.get('priceUsd', 0) or 0)
+        market_cap = float(pair.get('fdv', 0) or 0)
+
+        txns = pair.get('txns', {})
+        txns_5m = txns.get('m5', {}) if isinstance(txns, dict) else {}
+        buys_5m = int(txns_5m.get('buys', 0) or 0)
+        sells_5m = int(txns_5m.get('sells', 0) or 0)
+
+        vol = pair.get('volume', {})
+        volume_5m = float(vol.get('m5', 0) or 0)
+        volume_1h = float(vol.get('h1', 0) or 0)
+
+        total_txns = buys_5m + sells_5m
+        buy_ratio = buys_5m / total_txns if total_txns > 0 else 0.5
+
+        # 1. CRITICAL LIQUIDITY
+        if current_liq < RUG_LIQUIDITY_CRITICAL and pos.entry_liquidity > RUG_LIQUIDITY_CRITICAL:
+            return True, f"🚨 CRITICAL LIQ: ${current_liq:,.0f}"
+
+        # 2. LIQUIDITY PULLED
+        if pos.entry_liquidity > 0:
+            liq_drop_pct = ((pos.entry_liquidity - current_liq) / pos.entry_liquidity) * 100
+            if liq_drop_pct >= RUG_LIQUIDITY_DROP_PERCENT:
+                return True, f"🚨 LIQ PULLED: -{liq_drop_pct:.0f}%"
+
+        # 3. LIQUIDITY DROP FROM PEAK
+        if pos.highest_liquidity > 0:
+            liq_drop_from_peak = ((pos.highest_liquidity - current_liq) / pos.highest_liquidity) * 100
+            if liq_drop_from_peak >= 50:
+                return True, f"🚨 LIQ DRAINING: -{liq_drop_from_peak:.0f}%"
+
+        # 4. FLASH CRASH
+        if pos.last_price > 0 and current_price > 0:
+            price_drop = ((pos.last_price - current_price) / pos.last_price) * 100
+            if price_drop >= RUG_PRICE_CRASH_PERCENT:
+                return True, f"🚨 FLASH CRASH: -{price_drop:.0f}%"
+
+        # 5. MASSIVE SELL PRESSURE
+        if buy_ratio < RUG_SELL_PRESSURE_THRESHOLD and total_txns >= 5:
+            return True, f"🚨 DUMP: {buy_ratio * 100:.0f}% buys"
+
+        # 6. SELL PRESSURE SPIKE
+        if pos.last_buy_ratio > 0.6 and buy_ratio < 0.3 and total_txns >= 5:
+            return True, f"🚨 SELL SPIKE"
+
+        # 7. VOLUME SPIKE WITH SELLS
+        if volume_1h > 0:
+            avg_5m_vol = volume_1h / 12
+            if avg_5m_vol > 0:
+                vol_spike = volume_5m / avg_5m_vol
+                if vol_spike >= RUG_VOLUME_SPIKE_SELLS and buy_ratio < 0.35:
+                    return True, f"🚨 WHALE DUMP"
+
+        # 8. MCAP/LIQUIDITY RATIO
+        if current_liq > 0 and market_cap > 0:
+            mcap_liq_ratio = market_cap / current_liq
+            if mcap_liq_ratio > RUG_MCAP_LIQ_RATIO_MAX:
+                return True, f"🚨 ILLIQUID"
+
+        # 9. CUMULATIVE WARNINGS
+        warnings = 0
+        if pos.entry_liquidity > 0:
+            liq_drop = ((pos.entry_liquidity - current_liq) / pos.entry_liquidity) * 100
+            if 20 <= liq_drop < RUG_LIQUIDITY_DROP_PERCENT:
+                warnings += 1
+        if 0.25 < buy_ratio < 0.4 and total_txns >= 3:
+            warnings += 1
+        if current_price < pos.entry_price * 0.85:
+            warnings += 1
+
+        if warnings >= 2:
+            pos.rug_warnings += 1
+            if pos.rug_warnings >= 2:
+                return True, f"🚨 MULTI-WARNING"
+        else:
+            pos.rug_warnings = max(0, pos.rug_warnings - 1)
+
+        return False, ""
+
+    def fetch_pairs(self, url: str) -> list:
+        try:
+            self.stats['api_calls'] += 1
+            r = requests.get(url, timeout=10)
+            if r.status_code == 429:
+                time.sleep(3)
+                return []
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    return data
+                return data.get('pairs', []) or ([data.get('pair')] if data.get('pair') else [])
+        except:
+            self.stats['api_errors'] += 1
+        return []
+
+    def parse_token(self, pair: dict) -> Token | None:
+        try:
+            if not pair or not isinstance(pair, dict):
+                return None
+
+            base = pair.get('baseToken', {})
+            pc = pair.get('priceChange', {})
+            vol = pair.get('volume', {})
+            txns = pair.get('txns', {})
+            liq = pair.get('liquidity', {})
+
+            chain = pair.get('chainId', 'unknown')
+            pair_addr = pair.get('pairAddress', '')
+
+            if not chain or not pair_addr:
+                return None
+
+            unique_id = f"{chain}_{pair_addr}"
+            if self.is_token_dead(unique_id):
+                return None
+
+            price = float(pair.get('priceUsd', 0) or 0)
+            if price <= 0:
+                return None
+
+            liquidity = float(liq.get('usd', 0) or 0) if isinstance(liq, dict) else 0
+            if liquidity < MIN_LIQUIDITY:
+                return None
+
+            created = pair.get('pairCreatedAt', 0)
+            age_min = 9999
+            if created:
+                age_min = (time.time() * 1000 - created) / (1000 * 60)
+
+            txns_5m = txns.get('m5', {}) if isinstance(txns, dict) else {}
+            txns_1h = txns.get('h1', {}) if isinstance(txns, dict) else {}
+
+            token = Token(
+                symbol=base.get('symbol', '?')[:12],
+                name=base.get('name', '')[:30],
+                chain=chain,
+                contract=base.get('address', ''),
+                pair_address=pair_addr,
+                price=price,
+                market_cap=float(pair.get('fdv', 0) or 0),
+                liquidity=liquidity,
+                volume_5m=float(vol.get('m5', 0) or 0),
+                volume_1h=float(vol.get('h1', 0) or 0),
+                volume_24h=float(vol.get('h24', 0) or 0),
+                change_5m=float(pc.get('m5', 0) or 0),
+                change_1h=float(pc.get('h1', 0) or 0),
+                change_24h=float(pc.get('h24', 0) or 0),
+                buys_5m=int(txns_5m.get('buys', 0) or 0),
+                sells_5m=int(txns_5m.get('sells', 0) or 0),
+                buys_1h=int(txns_1h.get('buys', 0) or 0),
+                sells_1h=int(txns_1h.get('sells', 0) or 0),
+                age_minutes=age_min,
+                dex_url=pair.get('url', f"https://dexscreener.com/{chain}/{pair_addr}"),
+                dex_id=pair.get('dexId', '').lower(),
+                first_seen_price=price
+            )
+
+            signals = self.insider.analyze_token(token, pair)
+            token.insider_score = signals['score']
+            token.alert_reasons = signals['reasons']
+            token.is_new_token = signals['is_new']
+            token.is_volume_spike = signals['volume_spike']
+            token.is_whale_accumulating = signals['whale_buy']
+            token.is_coordinated_buy = signals['coordinated']
+            token.pump_score = self.calculate_pump_score(token)
+
+            return token
+        except:
+            return None
+
+    def calculate_pump_score(self, token: Token) -> float:
+        score = 0
+        if token.change_5m > 0:
+            score += min(token.change_5m * 0.5, 25)
+        if token.buy_pressure >= 0.6:
+            score += 15
+        if token.volume_5m > 1000:
+            score += 10
+        if token.liquidity >= MIN_LIQUIDITY:
+            score += 10
+        return score
+
+    def scan_for_pumps(self):
+        self.scanning = True
+        self.stats['last_scan'] = datetime.datetime.now().strftime('%H:%M:%S')
+
+        all_pairs = []
+        scan_sources = []
+
+        # 1. TOKEN PROFILES
+        try:
+            r = requests.get("https://api.dexscreener.com/token-boosts/top/v1", timeout=8)
+            if r.status_code == 200:
+                boosted = r.json()
+                scan_sources.append(f"Boosted:{len(boosted)}")
+                for item in boosted[:30]:
+                    addr = item.get('tokenAddress', '')
+                    if addr:
+                        p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{addr}")
+                        all_pairs.extend(p[:3])
+                        time.sleep(0.15)
+        except Exception as e:
+            print(Fore.RED + f"Boost fetch error: {e}")
+
+        # 2. LATEST TOKEN PROFILES
+        try:
+            r = requests.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=8)
+            if r.status_code == 200:
+                latest = r.json()
+                scan_sources.append(f"Latest:{len(latest)}")
+                for item in latest[:20]:
+                    addr = item.get('tokenAddress', '')
+                    if addr:
+                        p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{addr}")
+                        all_pairs.extend(p[:2])
+                        time.sleep(0.15)
+        except Exception as e:
+            print(Fore.RED + f"Latest fetch error: {e}")
+
+        # 3. SEARCH HOT TERMS
+        hot_terms = ['pump', 'moon', 'pepe', 'doge', 'shib', 'ape', 'wojak', 'chad', 'based', 'send']
+        for term in hot_terms:
+            try:
+                pairs = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/search?q={term}")
+                all_pairs.extend(pairs[:15])
+                time.sleep(0.2)
+            except:
+                pass
+        scan_sources.append(f"Search:{len(hot_terms)}terms")
+
+        # 4. PUMP.FUN
+        try:
+            r = requests.get(
+                "https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=created_timestamp&order=desc",
+                timeout=8
+            )
+            if r.status_code == 200:
+                coins = r.json()
+                scan_sources.append(f"PumpFun:{len(coins)}")
+                for coin in coins[:20]:
+                    mint = coin.get('mint', '')
+                    if mint:
+                        p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
+                        all_pairs.extend(p[:2])
+                        time.sleep(0.1)
+        except:
+            pass
+
+        # 5. CHAIN SEARCHES
+        for chain in ['solana', 'base', 'bsc']:
+            try:
+                pairs = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/search?q=chain:{chain}")
+                all_pairs.extend(pairs[:20])
+                time.sleep(0.2)
+            except:
+                pass
+
+        # ANALYZE
+        self.hot_tokens = {}
+        seen = set()
+        new_tokens = 0
+        vol_spikes = 0
+        whale_buys = 0
+        signals = 0
+        parsed = 0
+
+        for pair in all_pairs:
+            if not pair or not isinstance(pair, dict):
+                continue
+            addr = pair.get('pairAddress', '')
+            if not addr or addr in seen:
+                continue
+            seen.add(addr)
+
+            token = self.parse_token(pair)
+            if not token:
+                continue
+
+            parsed += 1
+            uid = token.get_unique_id()
+
+            if self.is_token_dead(uid):
+                continue
+
+            self.all_tokens[uid] = token
+
+            if token.is_new_token:
+                new_tokens += 1
+            if token.is_volume_spike:
+                vol_spikes += 1
+            if token.is_whale_accumulating:
+                whale_buys += 1
+
+            if (token.insider_score >= MIN_INSIDER_SCORE and
+                    not self.is_on_cooldown(uid) and
+                    not self.is_holding(uid) and
+                    not self.is_pending_buy(uid)):  # NEW: Check pending buys
+                self.hot_tokens[uid] = token
+                signals += 1
+
+        self.stats['total_scanned'] += parsed
+        self.stats['insider_signals'] = signals
+        self.stats['new_tokens_found'] = new_tokens
+        self.stats['volume_spikes_found'] = vol_spikes
+        self.stats['whale_buys_found'] = whale_buys
+
+        sources_str = ' | '.join(scan_sources)
+        print(Fore.CYAN + f"[{self.stats['last_scan']}] Scanned {parsed} pairs from {sources_str}")
+
+        if signals > 0:
+            top = sorted(self.hot_tokens.values(), key=lambda x: x.insider_score, reverse=True)[:5]
+            print(Fore.RED + f"🚨 {signals} SIGNALS: ", end="")
+            for t in top:
+                print(f"{t.symbol}({t.insider_score:.0f}) ", end="")
+            print()
+        else:
+            print(Fore.YELLOW + f"No signals meeting threshold (min score: {MIN_INSIDER_SCORE})")
+
+        self.scanning = False
+
+    def update_positions(self):
+        if not self.positions:
+            return
+
+        self.stats['last_price_update'] = datetime.datetime.now().strftime('%H:%M:%S')
+        positions_to_close = []
+
+        for pos in self.positions:
+            status, pair = self.check_pair_status(pos.chain, pos.pair_address)
+
+            if status == 'dead':
+                pos.fetch_failures += 1
+                if pos.fetch_failures >= MAX_FETCH_FAILURES:
+                    self.mark_token_dead(pos.unique_id, f"{pos.symbol} - no valid data")
+                    positions_to_close.append((pos, "☠️ TOKEN REMOVED/RUGGED"))
+                continue
+
+            if status == 'error':
+                continue
+
+            pos.fetch_failures = 0
+
+            if pair:
+                is_rug, rug_reason = self.check_rug_pull(pos, pair)
+                if is_rug:
+                    self.stats['rugs_avoided'] += 1
+                    positions_to_close.append((pos, rug_reason))
+                    continue
+
+                new_price = float(pair.get('priceUsd', 0) or 0)
+                liq = pair.get('liquidity', {})
+                new_liq = float(liq.get('usd', 0) or 0) if isinstance(liq, dict) else 0
+
+                txns = pair.get('txns', {})
+                txns_5m = txns.get('m5', {}) if isinstance(txns, dict) else {}
+                buys = int(txns_5m.get('buys', 0) or 0)
+                sells = int(txns_5m.get('sells', 0) or 0)
+                total = buys + sells
+                if total > 0:
+                    pos.last_buy_ratio = buys / total
+
+                if new_price > 0:
+                    pos.last_price = pos.current_price
+                    pos.current_price = new_price
+                    if new_price > pos.highest_price:
+                        pos.highest_price = new_price
+                    if pos.entry_price > 0:
+                        pos.pnl_percent = ((new_price - pos.entry_price) / pos.entry_price) * 100
+                        pos.pnl_usd = pos.amount_usd * (pos.pnl_percent / 100)
+
+                pos.last_liquidity = new_liq
+                if new_liq > pos.highest_liquidity:
+                    pos.highest_liquidity = new_liq
+
+            time.sleep(0.15)
+
+        for pos, reason in positions_to_close:
+            self.close_position(pos, reason)
+
+    def check_exits(self):
+        to_close = []
+
+        for pos in self.positions:
+            reason = None
+
+            if pos.pnl_percent >= TAKE_PROFIT_PERCENT:
+                reason = f"🎯 TAKE PROFIT +{pos.pnl_percent:.1f}%"
+            elif pos.pnl_percent <= -STOP_LOSS_PERCENT:
+                reason = f"🛑 STOP LOSS {pos.pnl_percent:.1f}%"
+            elif pos.highest_price > 0 and pos.pnl_percent > 5:
+                drop_from_high = ((pos.highest_price - pos.current_price) / pos.highest_price) * 100
+                if drop_from_high >= TRAILING_STOP_PERCENT:
+                    reason = f"📉 TRAILING STOP -{drop_from_high:.1f}%"
+            elif pos.get_hold_time_minutes() >= TIME_STOP_MINUTES:
+                if -5 <= pos.pnl_percent <= 5:
+                    reason = f"⏰ TIME STOP ({pos.get_hold_time_minutes():.0f}m)"
+
+            if reason:
+                to_close.append((pos, reason))
+
+        for pos, reason in to_close:
+            self.close_position(pos, reason)
+
+    def execute_buy(self, token: Token) -> bool:
+        unique_id = token.get_unique_id()
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Basic safety checks only - filters already passed in trader_loop
+        # ═══════════════════════════════════════════════════════════════════
+        if len(self.positions) >= MAX_POSITIONS:
+            print(Fore.YELLOW + f"   ⏭️ {token.symbol}: Max positions reached")
+            return False
+        if self.is_holding(unique_id):
+            print(Fore.YELLOW + f"   ⏭️ {token.symbol}: Already holding")
+            return False
+        if self.is_pending_buy(unique_id):
+            print(Fore.YELLOW + f"   ⏭️ {token.symbol}: Pending buy exists")
+            self.stats['double_buys_prevented'] += 1
+            return False
+        if self.is_token_dead(unique_id):
+            print(Fore.YELLOW + f"   ⏭️ {token.symbol}: Token marked dead")
+            if unique_id in self.hot_tokens:
+                del self.hot_tokens[unique_id]
+            return False
+
+        print(Fore.CYAN + f"   🔍 {token.symbol}: Checking pair status...")
+        status, pair = self.check_pair_status(token.chain, token.pair_address)
+        if status == 'dead':
+            print(Fore.RED + f"   ❌ {token.symbol}: Token removed/dead")
+            self.mark_token_dead(unique_id, "Dead before buy")
+            return False
+        if status == 'error':
+            print(Fore.YELLOW + f"   ⚠️ {token.symbol}: API error checking pair")
+            return False
+
+        print(Fore.CYAN + f"   ✓ {token.symbol}: Pair status OK")
+
+        entry_liquidity = token.liquidity
+        if pair:
+            fresh_price = float(pair.get('priceUsd', 0) or 0)
+            if fresh_price > 0:
+                token.price = fresh_price
+            liq = pair.get('liquidity', {})
+            entry_liquidity = float(liq.get('usd', 0) or 0) if isinstance(liq, dict) else token.liquidity
+
+        amount_usd = self.balance * (BUY_AMOUNT_PERCENT / 100)
+        if amount_usd < 5:  # Lowered from $10 to $5
+            print(Fore.YELLOW + f"   ⏭️ {token.symbol}: Buy amount too low (${amount_usd:.2f})")
+            return False
+
+        if token.price <= 0:
+            print(Fore.YELLOW + f"   ⏭️ {token.symbol}: Invalid price (${token.price})")
+            return False
+
+        print(Fore.CYAN + f"   💰 {token.symbol}: Buying ${amount_usd:.2f}...")
+
+        tokens_held = amount_usd / token.price
+        tx_hash = ''
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Mark as pending BEFORE attempting buy
+        # ═══════════════════════════════════════════════════════════════════
+        self.pending_buys[unique_id] = time.time()
+
+        # ═══════════════════════════════════════════════════════════════════
+        # REAL TRADING - Execute actual buy
+        # ═══════════════════════════════════════════════════════════════════
+        if not PAPER_TRADE and self.real_trader:
+            # Only trade Solana tokens
+            if token.chain != "solana":
+                print(Fore.YELLOW + f"⚠️ Skipping non-Solana token: {token.symbol} ({token.chain})")
+                del self.pending_buys[unique_id]
+                return False
+
+            if not token.contract:
+                print(Fore.RED + f"⚠️ No contract address for {token.symbol}")
+                del self.pending_buys[unique_id]
+                return False
+
+            print(Fore.RED + Style.BRIGHT + f"\n{'═' * 60}")
+            print(Fore.RED + f"🔴 REAL BUY ORDER - {token.symbol}")
+            print(Fore.WHITE + f"   Amount: ${amount_usd:.2f}")
+            print(Fore.WHITE + f"   Contract: {token.contract[:30]}...")
+            print(Fore.RED + f"{'═' * 60}")
+
+            try:
+                result = asyncio.run(self.real_trader.buy_token(token.contract, amount_usd))
+
+                if result.tx_hash:
+                    tx_hash = result.tx_hash
+
+                if not result.success:
+                    if result.error == "TIMEOUT_CHECK_MANUALLY":
+                        print(Fore.YELLOW + f"⚠️ TX sent but confirmation timed out")
+                        print(Fore.YELLOW + f"   Check wallet for tokens before retrying!")
+                        # Keep in pending to prevent immediate retry
+                    else:
+                        print(Fore.RED + f"❌ Real buy failed: {result.error}")
+                        del self.pending_buys[unique_id]
+                    return False
+
+                print(Fore.GREEN + f"✅ Real buy executed!")
+                print(Fore.GREEN + f"   TX: {result.tx_hash[:40]}...")
+
+                if result.amount_out > 0:
+                    tokens_held = result.amount_out
+
+                # Track fees
+                if result.fee_sol > 0:
+                    self.stats['total_fees_sol'] += result.fee_sol
+                    # Estimate USD (will be updated with actual price)
+                    self.stats['total_fees_usd'] += result.fee_sol * 150
+                self.stats['buy_count'] += 1
+
+            except Exception as e:
+                print(Fore.RED + f"❌ Real trading error: {e}")
+                del self.pending_buys[unique_id]
+                return False
+        # ═══════════════════════════════════════════════════════════════════
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PAPER TRADING - Apply realistic fees if enabled
+        # ═══════════════════════════════════════════════════════════════════
+        paper_fee_usd = 0
+        effective_entry_price = token.price
+        effective_amount_usd = amount_usd
+
+        if PAPER_TRADE and PAPER_REALISTIC_FEES:
+            # 1. Transaction fee (in USD)
+            sol_price = PAPER_SOL_PRICE_DEFAULT
+            try:
+                # Try to get current SOL price
+                import requests as req
+                r = req.get(f"https://api.dexscreener.com/latest/dex/tokens/{SOL_MINT}", timeout=5)
+                if r.status_code == 200:
+                    data = r.json()
+                    pairs = data.get("pairs", [])
+                    if pairs:
+                        sol_price = float(pairs[0].get("priceUsd", PAPER_SOL_PRICE_DEFAULT))
+            except:
+                pass
+
+            tx_fee_usd = PAPER_TOTAL_TX_FEE_SOL * sol_price
+
+            # 2. Slippage cost (you get less tokens because price moved up)
+            slippage_cost = amount_usd * (PAPER_BUY_SLIPPAGE_PERCENT / 100)
+
+            # 3. DEX fee
+            dex_fee = amount_usd * (PAPER_DEX_FEE_PERCENT / 100)
+
+            # Total paper fee
+            paper_fee_usd = tx_fee_usd + slippage_cost + dex_fee
+
+            # Your effective entry price is HIGHER due to slippage (you get fewer tokens)
+            # This simulates buying at a worse price
+            effective_entry_price = token.price * (1 + (PAPER_BUY_SLIPPAGE_PERCENT + PAPER_DEX_FEE_PERCENT) / 100)
+
+            # Tokens you actually receive (fewer due to fees eating into your buy)
+            tokens_held = (amount_usd - dex_fee) / effective_entry_price
+
+            # Track the fees
+            self.stats['total_fees_sol'] += PAPER_TOTAL_TX_FEE_SOL
+            self.stats['total_fees_usd'] += paper_fee_usd
+            self.stats['buy_count'] += 1
+
+            print(
+                Fore.YELLOW + f"   💸 Paper Fees: ${paper_fee_usd:.4f} (TX: ${tx_fee_usd:.4f} + Slip: ${slippage_cost:.4f} + DEX: ${dex_fee:.4f})")
+            print(Fore.YELLOW + f"   📊 Effective entry: ${effective_entry_price:.10f} (vs market ${token.price:.10f})")
+        # ═══════════════════════════════════════════════════════════════════
+
+        pos = Position(
+            symbol=token.symbol,
+            chain=token.chain,
+            contract=token.contract,
+            pair_address=token.pair_address,
+            entry_price=effective_entry_price,  # Use effective price with slippage
+            current_price=token.price,
+            amount_usd=amount_usd,
+            tokens_held=tokens_held,
+            entry_time=time.time(),
+            dex_url=token.get_chart_url(),
+            unique_id=unique_id,
+            insider_score_at_entry=token.insider_score,
+            alert_reasons=list(token.alert_reasons),
+            highest_price=token.price,
+            fetch_failures=0,
+            entry_liquidity=entry_liquidity,
+            last_liquidity=entry_liquidity,
+            highest_liquidity=entry_liquidity,
+            last_price=token.price,
+            last_buy_ratio=token.buy_pressure,
+            rug_warnings=0,
+            tx_hash=tx_hash
+        )
+
+        self.balance -= amount_usd
+        self.positions.append(pos)
+        self.stats['trades_executed'] += 1
+        self.add_to_cooldown(unique_id)
+
+        # Clear pending status now that position is created
+        if unique_id in self.pending_buys:
+            del self.pending_buys[unique_id]
+
+        if unique_id in self.hot_tokens:
+            del self.hot_tokens[unique_id]
+
+        reasons = ' | '.join(token.alert_reasons[:4])
+        mode = "🔴 REAL" if (not PAPER_TRADE and self.real_trader) else "📝 PAPER"
+
+        print(Fore.GREEN + Style.BRIGHT + f"\n{'═' * 74}")
+        print(Fore.GREEN + f"✅ {mode} BUY: {token.symbol} ({token.chain})")
+        print(Fore.WHITE + f"   💵 ${amount_usd:,.2f} @ ${token.price:.10f}")
+        print(Fore.RED + f"   🎯 Insider Score: {token.insider_score:.0f} | Age: {token.age_minutes:.0f}m")
+        print(Fore.MAGENTA + f"   🛡️ Entry Liq: ${entry_liquidity:,.0f}")
+        print(Fore.YELLOW + f"   📊 {reasons}")
+        print(Fore.CYAN + f"   🔗 {token.get_chart_url()}")
+        if tx_hash:
+            print(Fore.CYAN + f"   📜 TX: https://solscan.io/tx/{tx_hash}")
+        print(Fore.GREEN + f"{'═' * 74}\n")
+
+        self.save_state()
+        return True
+
+    def close_position(self, pos: Position, reason: str):
+        # ═══════════════════════════════════════════════════════════════════
+        # REAL TRADING - Execute actual sell with retry
+        # ═══════════════════════════════════════════════════════════════════
+        sell_success = False
+        actual_sol_received = 0
+
+        if not PAPER_TRADE and self.real_trader:
+            if pos.chain == "solana" and pos.contract:
+                print(Fore.RED + Style.BRIGHT + f"\n{'═' * 60}")
+                print(Fore.RED + f"🔴 REAL SELL ORDER - {pos.symbol}")
+                print(Fore.WHITE + f"   Reason: {reason}")
+                print(Fore.WHITE + f"   Expected P&L: {pos.pnl_percent:+.1f}%")
+                print(Fore.RED + f"{'═' * 60}")
+
+                # Try up to 2 times
+                for attempt in range(2):
+                    try:
+                        result = asyncio.run(self.real_trader.sell_token(pos.contract, sell_all=True))
+                        if result.success:
+                            print(Fore.GREEN + f"✅ Real sell executed!")
+                            if result.tx_hash:
+                                print(Fore.GREEN + f"   TX: {result.tx_hash[:40]}...")
+                            if result.amount_out > 0:
+                                actual_sol_received = result.amount_out
+                                # Get actual SOL price for accurate P&L
+                                try:
+                                    sol_price = asyncio.run(self.real_trader.get_sol_price())
+                                except:
+                                    sol_price = 150
+                                actual_usd = actual_sol_received * sol_price
+                                pos.pnl_usd = actual_usd - pos.amount_usd
+                                pos.pnl_percent = (pos.pnl_usd / pos.amount_usd) * 100
+                                print(Fore.GREEN + f"   💵 Received: {actual_sol_received:.4f} SOL (${actual_usd:.2f})")
+                                print(Fore.GREEN + f"   📊 Actual P&L: ${pos.pnl_usd:+.2f} ({pos.pnl_percent:+.1f}%)")
+
+                            # Track fees
+                            if result.fee_sol > 0:
+                                self.stats['total_fees_sol'] += result.fee_sol
+                                self.stats['total_fees_usd'] += result.fee_sol * sol_price
+                            self.stats['sell_count'] += 1
+
+                            sell_success = True
+                            break
+                        else:
+                            print(Fore.RED + f"⚠️ Sell attempt {attempt + 1} failed: {result.error}")
+                            if attempt == 0:
+                                print(Fore.YELLOW + f"   Retrying...")
+                                time.sleep(1)
+                    except Exception as e:
+                        print(Fore.RED + f"⚠️ Sell attempt {attempt + 1} error: {e}")
+                        if attempt == 0:
+                            time.sleep(1)
+
+                if not sell_success:
+                    print(Fore.RED + f"❌ SELL FAILED - tokens still in wallet!")
+                    print(Fore.YELLOW + f"   Sell manually on Jupiter/Raydium")
+                    print(Fore.YELLOW + f"   Contract: {pos.contract}")
+                    # DON'T remove from positions if sell failed
+                    return
+        # ═══════════════════════════════════════════════════════════════════
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PAPER TRADING - Apply realistic sell fees if enabled
+        # ═══════════════════════════════════════════════════════════════════
+        paper_sell_fee_usd = 0
+
+        if PAPER_TRADE and PAPER_REALISTIC_FEES:
+            # Get SOL price for fee calculation
+            sol_price = PAPER_SOL_PRICE_DEFAULT
+            try:
+                import requests as req
+                r = req.get(f"https://api.dexscreener.com/latest/dex/tokens/{SOL_MINT}", timeout=5)
+                if r.status_code == 200:
+                    data = r.json()
+                    pairs = data.get("pairs", [])
+                    if pairs:
+                        sol_price = float(pairs[0].get("priceUsd", PAPER_SOL_PRICE_DEFAULT))
+            except:
+                pass
+
+            # Calculate current position value BEFORE fees
+            current_value = pos.tokens_held * pos.current_price
+
+            # 1. Transaction fee
+            tx_fee_usd = PAPER_TOTAL_TX_FEE_SOL * sol_price
+
+            # 2. Slippage on sell (price drops as you sell)
+            slippage_cost = current_value * (PAPER_SELL_SLIPPAGE_PERCENT / 100)
+
+            # 3. DEX fee
+            dex_fee = current_value * (PAPER_DEX_FEE_PERCENT / 100)
+
+            # Total sell fees
+            paper_sell_fee_usd = tx_fee_usd + slippage_cost + dex_fee
+
+            # Adjust P&L to account for sell fees
+            # The actual amount you receive is less due to slippage and fees
+            actual_receive = current_value - slippage_cost - dex_fee
+            pos.pnl_usd = actual_receive - pos.amount_usd
+            pos.pnl_percent = (pos.pnl_usd / pos.amount_usd) * 100
+
+            # Track fees
+            self.stats['total_fees_sol'] += PAPER_TOTAL_TX_FEE_SOL
+            self.stats['total_fees_usd'] += paper_sell_fee_usd
+            self.stats['sell_count'] += 1
+
+            print(
+                Fore.YELLOW + f"   💸 Paper Sell Fees: ${paper_sell_fee_usd:.4f} (TX: ${tx_fee_usd:.4f} + Slip: ${slippage_cost:.4f} + DEX: ${dex_fee:.4f})")
+            print(Fore.YELLOW + f"   📊 Value before fees: ${current_value:.2f} → After: ${actual_receive:.2f}")
+        # ═══════════════════════════════════════════════════════════════════
+
+        # Only update balance if sell succeeded (or paper trading)
+        if sell_success or PAPER_TRADE or not self.real_trader:
+            final = pos.amount_usd + pos.pnl_usd
+            self.balance += final
+        else:
+            # Sell failed in real mode - don't add anything
+            return
+
+        is_rug_exit = "🚨" in reason
+
+        if pos.pnl_usd > 0:
+            self.stats['profitable_trades'] += 1
+            self.stats['total_profit'] += pos.pnl_usd
+            self.stats['current_streak'] += 1
+            if self.stats['current_streak'] > self.stats['win_streak']:
+                self.stats['win_streak'] = self.stats['current_streak']
+            if pos.pnl_usd > self.stats['best_trade']:
+                self.stats['best_trade'] = pos.pnl_usd
+        else:
+            self.stats['losing_trades'] += 1
+            self.stats['total_loss'] += abs(pos.pnl_usd)
+            self.stats['current_streak'] = 0
+            if pos.pnl_usd < self.stats['worst_trade']:
+                self.stats['worst_trade'] = pos.pnl_usd
+
+        pos.status = 'closed'
+        self.closed_trades.append(pos)
+        self.positions.remove(pos)
+        self.add_to_cooldown(pos.unique_id)
+
+        if is_rug_exit:
+            self.mark_token_dead(pos.unique_id, f"Rug: {reason}")
+
+        color = Fore.GREEN if pos.pnl_usd > 0 else Fore.RED
+        emoji = "💰" if pos.pnl_usd > 0 else "📉"
+        if is_rug_exit:
+            color = Fore.MAGENTA
+            emoji = "🛡️"
+
+        mode = "🔴 REAL" if (not PAPER_TRADE and self.real_trader) else "📝 PAPER"
+
+        print(color + Style.BRIGHT + f"\n{'═' * 74}")
+        print(color + f"{emoji} {mode} SOLD: {pos.symbol} ({pos.chain})")
+        print(Fore.WHITE + f"   {reason}")
+        print(color + f"   P&L: ${pos.pnl_usd:+,.2f} ({pos.pnl_percent:+.1f}%)")
+        print(Fore.WHITE + f"   💵 Balance: ${self.balance:,.2f}")
+        print(Fore.WHITE + f"   ⏱️ Held: {pos.get_hold_time_minutes():.1f} minutes")
+        if is_rug_exit:
+            print(Fore.MAGENTA + f"   🛡️ RUG PROTECTION SAVED YOU!")
+        print(color + f"{'═' * 74}\n")
+
+        # Sync balance with real wallet
+        if not PAPER_TRADE and self.real_trader:
+            try:
+                sol_balance = self.real_trader.get_sol_balance()
+                # Get SOL price synchronously
+                try:
+                    r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{SOL_MINT}", timeout=10)
+                    if r.status_code == 200:
+                        data = r.json()
+                        pairs = data.get("pairs", [])
+                        if pairs:
+                            sol_price = float(pairs[0].get("priceUsd", 150))
+                        else:
+                            sol_price = 150.0
+                    else:
+                        sol_price = 150.0
+                except:
+                    sol_price = 150.0
+                self.balance = sol_balance * sol_price
+            except:
+                pass
+
+        self.save_state()
+
+    def trader_loop(self):
+        while self.running:
+            try:
+                if self.auto_trade and not self.scanning:
+                    self.update_positions()
+                    self.check_exits()
+
+                    if len(self.positions) < MAX_POSITIONS and self.hot_tokens:
+                        top = sorted(self.hot_tokens.values(), key=lambda x: x.insider_score, reverse=True)
+                        for token in top[:3]:
+                            if token.insider_score >= MIN_INSIDER_SCORE:
+                                uid = token.get_unique_id()
+
+                                # Debug: show why we're skipping
+                                if self.is_token_dead(uid):
+                                    continue
+                                if self.is_pending_buy(uid):
+                                    continue
+                                if self.is_holding(uid):
+                                    continue
+                                if self.is_on_cooldown(uid):
+                                    continue
+
+                                # Check the filters that might be blocking
+                                if token.change_5m < 5.0:
+                                    print(
+                                        Fore.YELLOW + f"   ⏭️ {token.symbol}: 5m change too low ({token.change_5m:.1f}%)")
+                                    continue
+                                if token.change_1h < 0:
+                                    print(
+                                        Fore.YELLOW + f"   ⏭️ {token.symbol}: 1h change negative ({token.change_1h:.1f}%)")
+                                    continue
+                                if token.buy_pressure < 0.60:
+                                    print(
+                                        Fore.YELLOW + f"   ⏭️ {token.symbol}: buy pressure low ({token.buy_pressure:.2f})")
+                                    continue
+                                if token.change_5m > 100:
+                                    print(
+                                        Fore.YELLOW + f"   ⏭️ {token.symbol}: pumped too much ({token.change_5m:.1f}%)")
+                                    continue
+                                if self.balance < 10:
+                                    print(Fore.RED + f"   💸 Balance too low: ${self.balance:.2f}")
+                                    continue
+
+                                print(Fore.GREEN + f"   ✅ {token.symbol} passed filters, attempting buy...")
+                                if self.execute_buy(token):
+                                    time.sleep(0.5)
+                                    if len(self.positions) >= MAX_POSITIONS:
+                                        break
+
+                time.sleep(PRICE_UPDATE_INTERVAL)
+            except Exception as e:
+                print(Fore.RED + f"Trader error: {e}")
+                import traceback
+                traceback.print_exc()
+                time.sleep(3)
+
+    def scanner_loop(self):
+        while self.running:
+            try:
+                self.scan_for_pumps()
+                time.sleep(SCAN_INTERVAL)
+            except Exception as e:
+                print(Fore.RED + f"Scanner error: {e}")
+                time.sleep(5)
+
+    def display_dashboard(self):
+        os.system('cls' if os.name == 'nt' else 'clear')
+
+        mode = "🔴 REAL MONEY" if (not PAPER_TRADE and self.real_trader) else "📝 PAPER TRADING"
+        fees_mode = " (REALISTIC FEES)" if (PAPER_TRADE and PAPER_REALISTIC_FEES) else ""
+        print(Fore.RED + Style.BRIGHT + "╔" + "═" * 78 + "╗")
+        print(Fore.RED + Style.BRIGHT + "║" + f"{'🚀 PUMP SNIPER v8.6 - BALANCE CHECK 🚀':^78}" + "║")
+        print(Fore.RED + Style.BRIGHT + "║" + f"{(mode + fees_mode):^78}" + "║")
+        print(Fore.MAGENTA + Style.BRIGHT + "║" + f"{'🛡️ RUG + DOUBLE-BUY PROTECTION 🛡️':^78}" + "║")
+        print(Fore.RED + Style.BRIGHT + "╚" + "═" * 78 + "╝")
+
+        auto = Fore.GREEN + "ON " if self.auto_trade else Fore.RED + "OFF"
+        scan = Fore.YELLOW + "SCAN" if self.scanning else Fore.GREEN + "READY"
+
+        print(f"\n⏰ {datetime.datetime.now().strftime('%H:%M:%S')} | Auto: {auto}{Style.RESET_ALL} | "
+              f"{scan}{Style.RESET_ALL} | Last: {self.stats['last_scan'] or 'Never'}")
+
+        print(Fore.RED + f"🚨 Signals: {self.stats['insider_signals']} | "
+                         f"🆕 New: {self.stats['new_tokens_found']} | "
+                         f"📊 Spikes: {self.stats['volume_spikes_found']} | "
+                         f"🐋 Whales: {self.stats['whale_buys_found']} | "
+                         f"☠️ Dead: {len(self.dead_tokens)} | "
+              + Fore.MAGENTA + f"🛡️ Rugs: {self.stats.get('rugs_avoided', 0)} | "
+              + Fore.CYAN + f"🔒 2x Blocked: {self.stats.get('double_buys_prevented', 0)}")
+
+        pos_val = sum(p.amount_usd + p.pnl_usd for p in self.positions)
+        total = self.balance + pos_val
+        pnl = total - self.initial_balance
+        pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
+
+        print(f"\n{'─' * 80}")
+        print(Fore.YELLOW + Style.BRIGHT + "💰 ACCOUNT")
+        print(f"{'─' * 80}")
+        print(f"  Cash: ${self.balance:>12,.2f} | In Positions: ${pos_val:>12,.2f} | Total: ${total:>12,.2f}")
+        if self.initial_balance > 0:
+            print(pnl_color + f"  P&L: ${pnl:>+12,.2f} ({(pnl / self.initial_balance) * 100:+.1f}%)" + Style.RESET_ALL)
+        else:
+            print(pnl_color + f"  P&L: ${pnl:>+12,.2f} (N/A%)" + Style.RESET_ALL)
+
+        print(f"\n{'─' * 80}")
+        print(Fore.YELLOW + Style.BRIGHT + f"📊 POSITIONS ({len(self.positions)}/{MAX_POSITIONS})")
+        print(f"{'─' * 80}")
+
+        if self.positions:
+            for i, p in enumerate(self.positions, 1):
+                color = Fore.GREEN if p.pnl_usd >= 0 else Fore.RED
+                hold_time = p.get_hold_time_minutes()
+                peak_drop = ((p.highest_price - p.current_price) / p.highest_price * 100) if p.highest_price > 0 else 0
+                fail_warn = f" ⚠️({p.fetch_failures})" if p.fetch_failures > 0 else ""
+                liq_change = ""
+                if p.entry_liquidity > 0 and p.last_liquidity > 0:
+                    liq_pct = ((p.last_liquidity - p.entry_liquidity) / p.entry_liquidity) * 100
+                    if liq_pct < -20:
+                        liq_change = Fore.RED + f" 🛡️Liq:{liq_pct:+.0f}%" + Style.RESET_ALL
+                    elif liq_pct < -10:
+                        liq_change = Fore.YELLOW + f" Liq:{liq_pct:+.0f}%" + Style.RESET_ALL
+
+                print(f"  {i}. {p.symbol:<10} {p.chain:<8} "
+                      f"{color}${p.pnl_usd:>+9,.2f} ({p.pnl_percent:>+6.1f}%){Style.RESET_ALL} | "
+                      f"{hold_time:.0f}m | Peak: -{peak_drop:.0f}%{fail_warn}{liq_change}")
+                if p.alert_reasons:
+                    print(Fore.YELLOW + f"     {' | '.join(p.alert_reasons[:3])}" + Style.RESET_ALL)
+        else:
+            print(Fore.WHITE + "  Waiting for signals...")
+
+        if self.hot_tokens:
+            print(f"\n{'─' * 80}")
+            print(Fore.RED + Style.BRIGHT + f"🚨 HOT SIGNALS ({len(self.hot_tokens)})")
+            print(f"{'─' * 80}")
+
+            top = sorted(self.hot_tokens.values(), key=lambda x: x.insider_score, reverse=True)[:6]
+            for t in top:
+                reasons = ' | '.join(t.alert_reasons[:3])
+                badges = ""
+                if t.is_new_token:
+                    badges += "🆕"
+                if t.is_volume_spike:
+                    badges += "📊"
+                if t.is_whale_accumulating:
+                    badges += "🐋"
+                if t.is_coordinated_buy:
+                    badges += "🎯"
+
+                print(f"  {badges} {t.symbol:<10} {t.chain:<6} "
+                      f"Score: {Fore.RED}{t.insider_score:>3.0f}{Style.RESET_ALL} | {reasons}")
+
+        print(f"\n{'─' * 80}")
+        print(Fore.YELLOW + Style.BRIGHT + "📈 TRADING STATS")
+        print(f"{'─' * 80}")
+
+        wr = (self.stats['profitable_trades'] / max(1, self.stats['trades_executed'])) * 100
+        net = self.stats['total_profit'] - self.stats['total_loss']
+        fees_sol = self.stats.get('total_fees_sol', 0)
+        fees_usd = self.stats.get('total_fees_usd', 0)
+
+        # Calculate TRUE net after fees
+        true_net = net - fees_usd
+
+        print(f"  Trades: {self.stats['trades_executed']} | "
+              f"Win: {Fore.GREEN}{self.stats['profitable_trades']}{Style.RESET_ALL} | "
+              f"Loss: {Fore.RED}{self.stats['losing_trades']}{Style.RESET_ALL} | "
+              f"Rate: {wr:.0f}% | "
+              f"Streak: {self.stats['current_streak']} (Best: {self.stats['win_streak']})")
+
+        print(f"  Profit: {Fore.GREEN}${self.stats['total_profit']:,.2f}{Style.RESET_ALL} | "
+              f"Loss: {Fore.RED}${self.stats['total_loss']:,.2f}{Style.RESET_ALL} | "
+              f"Net: {Fore.GREEN if net >= 0 else Fore.RED}${net:+,.2f}{Style.RESET_ALL} | "
+              + Fore.MAGENTA + f"🛡️ Rugs Avoided: {self.stats.get('rugs_avoided', 0)}")
+
+        print(f"  Best: {Fore.GREEN}${self.stats['best_trade']:+,.2f}{Style.RESET_ALL} | "
+              f"Worst: {Fore.RED}${self.stats['worst_trade']:+,.2f}{Style.RESET_ALL} | "
+              f"Scanned: {self.stats['total_scanned']:,} | "
+              + Fore.YELLOW + f"💸 Fees: {fees_sol:.4f} SOL (${fees_usd:.2f})")
+
+        # Show true P&L after fees (the real number!)
+        if PAPER_TRADE and PAPER_REALISTIC_FEES and fees_usd > 0:
+            true_color = Fore.GREEN if true_net >= 0 else Fore.RED
+            print(true_color + Style.BRIGHT + f"  ⚠️  TRUE NET (after fees): ${true_net:+,.2f}" + Style.RESET_ALL)
+            if true_net < 0 and net > 0:
+                print(Fore.RED + f"     📉 Fees ate ${fees_usd:.2f} of your ${net:.2f} gross profit!" + Style.RESET_ALL)
+
+    def display_signals(self):
+        print(Fore.RED + Style.BRIGHT + f"\n{'═' * 100}")
+        print(Fore.RED + f"🚨 INSIDER SIGNALS ({len(self.hot_tokens)}) - Sorted by Score")
+        print(f"{'═' * 100}")
+
+        if not self.hot_tokens:
+            print(Fore.YELLOW + "No active signals - scanning...")
+            return
+
+        sorted_tokens = sorted(self.hot_tokens.values(), key=lambda x: x.insider_score, reverse=True)
+
+        print(f"\n{'#':<3} {'Symbol':<10} {'Chain':<7} {'Score':<6} {'Age':<8} {'5m%':<8} {'Liq':<12} {'Signals':<35}")
+        print("-" * 100)
+
+        for i, t in enumerate(sorted_tokens[:20], 1):
+            age_str = f"{t.age_minutes:.0f}m" if t.age_minutes < 60 else f"{t.age_minutes / 60:.1f}h"
+            reasons = ' | '.join(t.alert_reasons[:3])
+            badges = ""
+            if t.is_new_token:
+                badges += "🆕"
+            if t.is_volume_spike:
+                badges += "📊"
+            if t.is_whale_accumulating:
+                badges += "🐋"
+            change_color = Fore.GREEN if t.change_5m > 0 else Fore.RED
+            print(f"{i:<3} {badges}{t.symbol:<8} {t.chain:<7} "
+                  f"{Fore.RED}{t.insider_score:<6.0f}{Style.RESET_ALL} "
+                  f"{age_str:<8} "
+                  f"{change_color}{t.change_5m:<+8.1f}{Style.RESET_ALL} "
+                  f"${t.liquidity:<11,.0f} "
+                  f"{reasons:<35}")
+
+        print(f"\n{'─' * 100}")
+        choice = input(Fore.YELLOW + "Enter # to open chart (or Enter to go back): " + Style.RESET_ALL).strip()
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(sorted_tokens):
+                webbrowser.open(sorted_tokens[idx].get_chart_url())
+                print(Fore.GREEN + "✓ Opened chart")
+
+    def display_positions(self):
+        print(Fore.CYAN + Style.BRIGHT + f"\n{'═' * 90}")
+        print(Fore.CYAN + "📊 POSITIONS - DETAILED VIEW")
+        print(f"{'═' * 90}")
+
+        if not self.positions:
+            print(Fore.YELLOW + "No open positions")
+            return
+
+        for i, p in enumerate(self.positions, 1):
+            color = Fore.GREEN if p.pnl_usd >= 0 else Fore.RED
+            hold_time = p.get_hold_time_minutes()
+            peak_drop = ((p.highest_price - p.current_price) / p.highest_price * 100) if p.highest_price > 0 else 0
+
+            print(f"\n{Fore.CYAN}{'─' * 90}")
+            print(f"{i}. {Fore.WHITE + Style.BRIGHT}{p.symbol}{Style.RESET_ALL} ({p.chain})")
+            print(f"   Entry:   ${p.entry_price:.12f}")
+            print(f"   Current: ${p.current_price:.12f}")
+            print(f"   Peak:    ${p.highest_price:.12f} (down {peak_drop:.1f}%)")
+            print(color + f"   P&L:     ${p.pnl_usd:+,.2f} ({p.pnl_percent:+.1f}%)" + Style.RESET_ALL)
+            print(f"   Amount:  ${p.amount_usd:.2f} | Hold: {hold_time:.1f}m")
+            print(f"   Score:   {p.insider_score_at_entry:.0f} at entry")
+            print(Fore.MAGENTA + f"   🛡️ RUG PROTECTION:")
+            liq_change = ((
+                                  p.last_liquidity - p.entry_liquidity) / p.entry_liquidity * 100) if p.entry_liquidity > 0 else 0
+            print(
+                f"      Entry Liq: ${p.entry_liquidity:,.0f} | Current: ${p.last_liquidity:,.0f} ({liq_change:+.0f}%)")
+            print(f"      Peak Liq: ${p.highest_liquidity:,.0f} | Warnings: {p.rug_warnings}" + Style.RESET_ALL)
+            if p.fetch_failures > 0:
+                print(Fore.RED + f"   ⚠️ Fetch Failures: {p.fetch_failures}/{MAX_FETCH_FAILURES}" + Style.RESET_ALL)
+            if p.alert_reasons:
+                print(Fore.YELLOW + f"   Signals: {' | '.join(p.alert_reasons)}" + Style.RESET_ALL)
+            print(Fore.CYAN + f"   🔗 {p.get_chart_url()}" + Style.RESET_ALL)
+            if p.tx_hash:
+                print(Fore.CYAN + f"   📜 TX: https://solscan.io/tx/{p.tx_hash}" + Style.RESET_ALL)
+
+        print(f"\n{'─' * 90}")
+        print("[#] Open chart | [c#] Close position | [Enter] Back")
+        choice = input(Fore.YELLOW + "Choice: " + Style.RESET_ALL).strip().lower()
+
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(self.positions):
+                webbrowser.open(self.positions[idx].get_chart_url())
+        elif choice.startswith('c') and choice[1:].isdigit():
+            idx = int(choice[1:]) - 1
+            if 0 <= idx < len(self.positions):
+                if input(Fore.RED + f"Close {self.positions[idx].symbol}? (y/n): ").lower() == 'y':
+                    self.close_position(self.positions[idx], "MANUAL CLOSE")
+
+    def display_history(self):
+        print(Fore.CYAN + Style.BRIGHT + f"\n{'═' * 90}")
+        print(Fore.CYAN + f"📜 TRADE HISTORY ({len(self.closed_trades)} trades)")
+        print(f"{'═' * 90}")
+
+        if not self.closed_trades:
+            print(Fore.YELLOW + "No trades yet")
+            return
+
+        print(f"\n{'Symbol':<12} {'Chain':<8} {'P&L':>14} {'%':>8} {'Result':<10}")
+        print("-" * 60)
+
+        for trade in reversed(self.closed_trades[-20:]):
+            color = Fore.GREEN if trade.pnl_usd > 0 else Fore.RED
+            result = "✅ WIN" if trade.pnl_usd > 0 else "❌ LOSS"
+            print(f"{trade.symbol:<12} {trade.chain:<8} "
+                  f"{color}${trade.pnl_usd:>+12,.2f}{Style.RESET_ALL} "
+                  f"{color}{trade.pnl_percent:>+7.1f}%{Style.RESET_ALL} "
+                  f"{color}{result}{Style.RESET_ALL}")
+
+        if len(self.closed_trades) > 20:
+            print(Fore.YELLOW + f"\n... showing last 20 of {len(self.closed_trades)} trades")
+
+    def display_diagnostics(self):
+        print(Fore.CYAN + Style.BRIGHT + f"\n{'═' * 80}")
+        print(Fore.CYAN + "🔧 DIAGNOSTICS & SETTINGS")
+        print(f"{'═' * 80}")
+
+        mode = "🔴 REAL MONEY" if (not PAPER_TRADE and self.real_trader) else "📝 PAPER TRADING"
+        print(Fore.RED + Style.BRIGHT + f"\n💰 MODE: {mode}")
+
+        if not PAPER_TRADE and self.real_trader:
+            print(Fore.GREEN + f"   Wallet: {str(self.real_trader.pubkey)[:30]}...")
+            sol_bal = self.real_trader.get_sol_balance()
+            print(Fore.GREEN + f"   SOL Balance: {sol_bal:.4f} SOL")
+
+        print(Fore.YELLOW + "\n⚡ SPEED SETTINGS:")
+        print(f"  Scan Interval:    {SCAN_INTERVAL}s")
+        print(f"  Price Update:     {PRICE_UPDATE_INTERVAL}s")
+        print(f"  Cooldown:         {COOLDOWN_AFTER_TRADE}s")
+
+        print(Fore.YELLOW + "\n💰 POSITION SETTINGS:")
+        print(f"  Buy Amount:       {BUY_AMOUNT_PERCENT}% of balance")
+        print(f"  Max Positions:    {MAX_POSITIONS}")
+        print(f"  Min Liquidity:    ${MIN_LIQUIDITY:,}")
+
+        print(Fore.YELLOW + "\n🎯 EXIT SETTINGS:")
+        print(f"  Take Profit:      +{TAKE_PROFIT_PERCENT}%")
+        print(f"  Stop Loss:        -{STOP_LOSS_PERCENT}%")
+        print(f"  Trailing Stop:    {TRAILING_STOP_PERCENT}% from peak")
+        print(f"  Time Stop:        {TIME_STOP_MINUTES} minutes")
+
+        print(Fore.MAGENTA + "\n🛡️ RUG PROTECTION:")
+        print(f"  Liq Drop Exit:    -{RUG_LIQUIDITY_DROP_PERCENT}%")
+        print(f"  Critical Liq:     ${RUG_LIQUIDITY_CRITICAL:,}")
+        print(f"  Flash Crash:      -{RUG_PRICE_CRASH_PERCENT}%")
+
+        print(Fore.CYAN + "\n🔒 DOUBLE-BUY PROTECTION:")
+        print(f"  Max TX Retries:   {MAX_TX_RETRIES} (was 3)")
+        print(f"  TX Timeout:       {TX_TIMEOUT}s (was 60)")
+        print(f"  Pending Buys:     {len(self.pending_buys)}")
+        print(f"  Double-buys blocked: {self.stats.get('double_buys_prevented', 0)}")
+
+        print(Fore.YELLOW + "\n🌐 API STATS:")
+        print(f"  Total Calls:      {self.stats['api_calls']:,}")
+        print(f"  API Errors:       {self.stats['api_errors']:,}")
+        print(f"  Tokens Scanned:   {self.stats['total_scanned']:,}")
+
+        # Show realistic paper trading fee settings
+        if PAPER_TRADE:
+            print(Fore.YELLOW + "\n💸 PAPER TRADING FEE SIMULATION:")
+            if PAPER_REALISTIC_FEES:
+                print(Fore.GREEN + f"  Status:           ENABLED (realistic mode)")
+                print(f"  TX Fee:           {PAPER_TOTAL_TX_FEE_SOL:.6f} SOL per trade")
+                print(f"  Buy Slippage:     {PAPER_BUY_SLIPPAGE_PERCENT}%")
+                print(f"  Sell Slippage:    {PAPER_SELL_SLIPPAGE_PERCENT}%")
+                print(f"  DEX Fee:          {PAPER_DEX_FEE_PERCENT}%")
+                total_buy_cost = PAPER_BUY_SLIPPAGE_PERCENT + PAPER_DEX_FEE_PERCENT
+                total_sell_cost = PAPER_SELL_SLIPPAGE_PERCENT + PAPER_DEX_FEE_PERCENT
+                print(Fore.RED + f"  Round-trip drag:  ~{total_buy_cost + total_sell_cost:.1f}% + TX fees")
+                print(Fore.RED + f"  ⚠️  You need >{total_buy_cost + total_sell_cost:.0f}% gains just to break even!")
+            else:
+                print(Fore.RED + f"  Status:           DISABLED (unrealistic - no fees)")
+                print(f"  Set PAPER_REALISTIC_FEES = True for accurate simulation")
+
+    def run(self):
+        scanner_thread = threading.Thread(target=self.scanner_loop, daemon=True)
+        trader_thread = threading.Thread(target=self.trader_loop, daemon=True)
+
+        scanner_thread.start()
+        trader_thread.start()
+
+        mode = "🔴 REAL MONEY" if (not PAPER_TRADE and self.real_trader) else "📝 PAPER"
+        print(Fore.GREEN + f"\n✓ {mode} MODE RUNNING")
+        print(Fore.MAGENTA + "🛡️ RUG PULL PROTECTION ACTIVE")
+        print(Fore.CYAN + "🔒 DOUBLE-BUY PROTECTION ACTIVE")
+        print(Fore.YELLOW + "\nPress Enter to continue...")
+        input()
+
+        while self.running:
+            try:
+                self.display_dashboard()
+
+                print(f"\n{'─' * 80}")
+                print(Fore.CYAN + Style.BRIGHT + "📌 MENU")
+                print(f"{'─' * 80}")
+                print("  1. 🔄 Refresh Dashboard")
+                print("  2. 🚨 View All Signals")
+                print("  3. 📊 Manage Positions")
+                print("  4. 📜 Trade History")
+                print("  5. 🔧 Diagnostics")
+                print("  6. 🔍 Force Scan Now")
+                print(
+                    f"  7. 🤖 Toggle Auto-Trade ({Fore.GREEN + 'ON' if self.auto_trade else Fore.RED + 'OFF'}{Style.RESET_ALL})")
+                print("  8. 💰 Reset Everything")
+                print("  9. 🚪 Exit")
+                print(f"{'─' * 80}")
+
+                choice = input("\nSelect (1-9): ").strip()
+
+                if choice == '1':
+                    continue
+                elif choice == '2':
+                    self.display_signals()
+                    input("\nPress Enter...")
+                elif choice == '3':
+                    self.display_positions()
+                    input("\nPress Enter...")
+                elif choice == '4':
+                    self.display_history()
+                    input("\nPress Enter...")
+                elif choice == '5':
+                    self.display_diagnostics()
+                    input("\nPress Enter...")
+                elif choice == '6':
+                    print(Fore.YELLOW + "\n🔍 Running manual scan...")
+                    self.scan_for_pumps()
+                    input("\nPress Enter...")
+                elif choice == '7':
+                    self.auto_trade = not self.auto_trade
+                    status = Fore.GREEN + "ENABLED" if self.auto_trade else Fore.RED + "DISABLED"
+                    print(f"\n🤖 Auto-trade {status}")
+                    time.sleep(1)
+                elif choice == '8':
+                    confirm = input(
+                        Fore.RED + "\n⚠️ Reset balance and all stats? (yes/no): " + Style.RESET_ALL).strip().lower()
+                    if confirm == 'yes':
+                        self.balance = INITIAL_BALANCE
+                        self.positions = []
+                        self.closed_trades = []
+                        self.recently_traded = {}
+                        self.dead_tokens = set()
+                        self.hot_tokens = {}
+                        self.all_tokens = {}
+                        self.pending_buys = {}
+                        self.stats = {k: 0 if isinstance(v, (int, float)) else None for k, v in self.stats.items()}
+                        self.save_state()
+                        print(Fore.GREEN + "✓ Everything reset!")
+                        time.sleep(1)
+                elif choice == '9':
+                    self.running = False
+                    print(Fore.YELLOW + "\n👋 Shutting down...")
+                    self.save_state()
+                    break
+
+            except KeyboardInterrupt:
+                self.running = False
+                print(Fore.YELLOW + "\n\n👋 Interrupted! Saving...")
+                self.save_state()
+                break
+            except Exception as e:
+                print(Fore.RED + f"\nError: {e}")
+                time.sleep(2)
+
+        print(Fore.GREEN + "✓ Goodbye! Portfolio saved.")
+
+
+if __name__ == "__main__":
+    sniper = PumpSniper()
+    sniper.run()
