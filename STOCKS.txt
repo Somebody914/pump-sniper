@@ -37,58 +37,19 @@ init(autoreset=True)
 PAPER_TRADE = True  # ← SET TO False FOR REAL TRADING (only after testing!)
 
 INITIAL_BALANCE = 10000  # Only used for paper trading
-BUY_AMOUNT_PERCENT = 15  # Smaller positions = less risk
+BUY_AMOUNT_PERCENT = 20
 MAX_POSITIONS = 4
 
 # ENTRY FILTERS
 MIN_LIQUIDITY = 8000
-MIN_INSIDER_SCORE = 90
-MIN_CHANGE_5M = 6.0
-MIN_BUY_PRESSURE = 0.65
-MIN_VOLUME_5M = 500
-MIN_SIGNALS_REQUIRED = 2
-MAX_CHANGE_5M = 150
-LOW_BUY_PRESSURE_PENALTY_THRESHOLD = 0.45  # Penalize if buy pressure below this
-
-# Market Cap Filters
-MIN_MARKET_CAP = 5000  # $5k minimum
-MAX_MARKET_CAP = 500000  # $500k maximum - above this already pumped
-IDEAL_MCAP_LOW = 10000  # $10k
-IDEAL_MCAP_HIGH = 50000  # $50k - sweet spot for pumps
-MAX_MCAP_LIQ_RATIO = 50  # Market cap shouldn't be more than 50x liquidity
-
-# Pump.fun Scanning
-PUMPFUN_COINS_LIMIT = 30  # Number of pump.fun coins to process
+MIN_INSIDER_SCORE = 75
+MIN_CHANGE_5M = 3.0
 
 # EXIT STRATEGY
-TAKE_PROFIT_PERCENT = 500  # Let moonshots ride!
-STOP_LOSS_PERCENT = 5  # Cut losers faster
+TAKE_PROFIT_PERCENT = 32
+STOP_LOSS_PERCENT = 7.5
 TRAILING_STOP_PERCENT = 6
 TIME_STOP_MINUTES = 11
-
-# Dynamic Trailing Stop Profit Thresholds
-PROFIT_THRESHOLD_MOON = 200    # 200%+ profit
-PROFIT_THRESHOLD_HUGE = 100    # 100-200% profit
-PROFIT_THRESHOLD_LARGE = 50    # 50-100% profit
-PROFIT_THRESHOLD_MEDIUM = 20   # 20-50% profit
-
-# Dynamic Trailing Stops (percentage drop from high allowed)
-TRAILING_STOP_SMALL = 10   # Under 20% profit
-TRAILING_STOP_MEDIUM = 7   # 20-50% profit
-TRAILING_STOP_LARGE = 5    # 50-100% profit
-TRAILING_STOP_HUGE = 4     # 100-200% profit
-TRAILING_STOP_MOON = 3     # 200%+ profit
-
-# Momentum Protection
-MIN_BUY_PRESSURE_TO_HOLD = 0.70
-MOMENTUM_OVERRIDE_PROFIT = 30
-MOMENTUM_TRAILING_MULTIPLIER = 1.5  # Give 50% more room when momentum is strong
-
-# Market Cap Scoring Thresholds
-MCAP_PERFECT_LOW = 5000   # $5k
-MCAP_PERFECT_HIGH = 25000  # $25k - perfect entry range
-MCAP_GOOD_HIGH = 50000     # $50k - good entry
-MCAP_OK_HIGH = 100000      # $100k - okay entry
 
 # TIMING
 SCAN_INTERVAL = 3
@@ -854,18 +815,6 @@ class Position:
     def get_hold_time_minutes(self) -> float:
         return (time.time() - self.entry_time) / 60
 
-    def get_dynamic_trailing_stop(self) -> float:
-        if self.pnl_percent >= PROFIT_THRESHOLD_MOON:
-            return TRAILING_STOP_MOON
-        elif self.pnl_percent >= PROFIT_THRESHOLD_HUGE:
-            return TRAILING_STOP_HUGE
-        elif self.pnl_percent >= PROFIT_THRESHOLD_LARGE:
-            return TRAILING_STOP_LARGE
-        elif self.pnl_percent >= PROFIT_THRESHOLD_MEDIUM:
-            return TRAILING_STOP_MEDIUM
-        else:
-            return TRAILING_STOP_SMALL
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # INSIDER DETECTOR
@@ -1005,57 +954,6 @@ class InsiderDetector:
         if 5000 <= token.liquidity <= 50000:
             signals['score'] += 10
 
-        # 10. PENALTY: Low buy pressure
-        if 0 < token.buy_pressure < LOW_BUY_PRESSURE_PENALTY_THRESHOLD:
-            signals['score'] -= 20
-            signals['reasons'].append(f"⚠️ Low buys {token.buy_pressure * 100:.0f}%")
-
-        # 11. PENALTY: Negative 1h change
-        if token.change_1h < 0:
-            signals['score'] -= 15
-            signals['reasons'].append(f"📉 1h: {token.change_1h:.0f}%")
-
-        # 12. PENALTY: Low volume
-        if token.volume_5m < MIN_VOLUME_5M:
-            signals['score'] -= 25
-            signals['reasons'].append(f"⚠️ Low vol ${token.volume_5m:.0f}")
-
-        # 13. PENALTY: Overpumped (already up too much)
-        if token.change_5m > MAX_CHANGE_5M:
-            signals['score'] -= 30
-            signals['reasons'].append(f"⚠️ Overpumped +{token.change_5m:.0f}%")
-
-        # 14. MARKET CAP SCORING
-        if token.market_cap > 0:
-            if token.market_cap >= MCAP_PERFECT_LOW and token.market_cap < MCAP_PERFECT_HIGH:
-                signals['score'] += 30
-                signals['reasons'].append(f"💎 Perfect mcap ${token.market_cap / 1000:.0f}k")
-            elif token.market_cap >= MCAP_PERFECT_HIGH and token.market_cap < MCAP_GOOD_HIGH:
-                signals['score'] += 20
-                signals['reasons'].append(f"✨ Good mcap ${token.market_cap / 1000:.0f}k")
-            elif token.market_cap >= MCAP_GOOD_HIGH and token.market_cap < MCAP_OK_HIGH:
-                signals['score'] += 10
-                signals['reasons'].append(f"📊 OK mcap ${token.market_cap / 1000:.0f}k")
-            elif token.market_cap > MAX_MARKET_CAP:
-                signals['score'] -= 20
-                signals['reasons'].append(f"⚠️ Big mcap ${token.market_cap / 1000:.0f}k")
-
-        # 15. Track signal count for MIN_SIGNALS_REQUIRED filter
-        signal_count = 0
-        if signals['is_new']:
-            signal_count += 1
-        if signals['volume_spike']:
-            signal_count += 1
-        if signals['whale_buy']:
-            signal_count += 1
-        if signals['coordinated']:
-            signal_count += 1
-        if token.change_5m >= 10:
-            signal_count += 1
-        if token.buy_pressure >= MIN_BUY_PRESSURE:
-            signal_count += 1
-        signals['signal_count'] = signal_count
-
         return signals
 
 
@@ -1147,11 +1045,7 @@ class PumpSniper:
             'total_fees_sol': 0,  # Track fees in SOL
             'total_fees_usd': 0,  # Track fees in USD
             'buy_count': 0,
-            'sell_count': 0,
-            'momentum_saves': 0,
-            'filtered_out': 0,
-            'low_mcap_skipped': 0,
-            'high_mcap_skipped': 0
+            'sell_count': 0
         }
 
         self.running = True
@@ -1563,43 +1457,18 @@ class PumpSniper:
                 pass
         scan_sources.append(f"Search:{len(hot_terms)}terms")
 
-        # 4. PUMP.FUN - Enhanced scanning for fresh launches
-        # Scan Pump.fun NEW coins
+        # 4. PUMP.FUN
         try:
             r = requests.get(
-                "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=desc",
+                "https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=created_timestamp&order=desc",
                 timeout=8
             )
             if r.status_code == 200:
                 coins = r.json()
-                scan_sources.append(f"PumpFun-New:{len(coins)}")
-                for coin in coins[:PUMPFUN_COINS_LIMIT]:  # Check more coins
+                scan_sources.append(f"PumpFun:{len(coins)}")
+                for coin in coins[:20]:
                     mint = coin.get('mint', '')
                     if mint:
-                        # Get market cap from pump.fun data if available
-                        mcap = float(coin.get('usd_market_cap', 0) or 0)
-                        # Fetch if no mcap data OR if mcap is in valid range
-                        if mcap == 0 or mcap < MAX_MARKET_CAP:
-                            p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
-                            all_pairs.extend(p[:2])
-                        time.sleep(0.1)
-        except:
-            pass
-
-        # Scan Pump.fun GRADUATING/ACTIVE coins (about to hit Raydium - high potential!)
-        try:
-            r = requests.get(
-                "https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=last_trade_timestamp&order=desc",
-                timeout=8
-            )
-            if r.status_code == 200:
-                coins = r.json()
-                scan_sources.append(f"PumpFun-Active:{len(coins)}")
-                for coin in coins[:PUMPFUN_COINS_LIMIT]:
-                    mint = coin.get('mint', '')
-                    mcap = float(coin.get('usd_market_cap', 0) or 0)
-                    # Look for coins with good market cap that are actively trading
-                    if mint and (mcap == 0 or (mcap > MIN_MARKET_CAP and mcap < MAX_MARKET_CAP)):
                         p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
                         all_pairs.extend(p[:2])
                         time.sleep(0.1)
@@ -1651,24 +1520,7 @@ class PumpSniper:
             if token.is_whale_accumulating:
                 whale_buys += 1
 
-            # Check if passes all filters
-            passes_filters = True
-
-            # Market cap checks
-            if token.market_cap > 0:
-                if token.market_cap > MAX_MARKET_CAP:
-                    passes_filters = False  # Too big, already pumped
-                    self.stats['high_mcap_skipped'] += 1
-                if token.market_cap < MIN_MARKET_CAP:
-                    passes_filters = False  # Too small, might be dead
-                    self.stats['low_mcap_skipped'] += 1
-
-            # Check insider score threshold
-            if token.insider_score < MIN_INSIDER_SCORE:
-                passes_filters = False
-                self.stats['filtered_out'] += 1
-
-            if (passes_filters and
+            if (token.insider_score >= MIN_INSIDER_SCORE and
                     not self.is_on_cooldown(uid) and
                     not self.is_holding(uid) and
                     not self.is_pending_buy(uid)):  # NEW: Check pending buys
@@ -1766,18 +1618,8 @@ class PumpSniper:
                 reason = f"🛑 STOP LOSS {pos.pnl_percent:.1f}%"
             elif pos.highest_price > 0 and pos.pnl_percent > 5:
                 drop_from_high = ((pos.highest_price - pos.current_price) / pos.highest_price) * 100
-                trailing_stop = pos.get_dynamic_trailing_stop()
-
-                # Momentum protection - don't sell if still pumping hard
-                if pos.pnl_percent >= MOMENTUM_OVERRIDE_PROFIT and pos.last_buy_ratio >= MIN_BUY_PRESSURE_TO_HOLD:
-                    # Widen trailing stop when momentum is strong
-                    trailing_stop = trailing_stop * MOMENTUM_TRAILING_MULTIPLIER
-                    if drop_from_high >= trailing_stop:
-                        reason = f"📉 MOMENTUM TRAIL -{drop_from_high:.1f}%"
-                    else:
-                        self.stats['momentum_saves'] += 1  # Track saves
-                elif drop_from_high >= trailing_stop:
-                    reason = f"📉 TRAILING STOP -{drop_from_high:.1f}% (trail={trailing_stop:.0f}%)"
+                if drop_from_high >= TRAILING_STOP_PERCENT:
+                    reason = f"📉 TRAILING STOP -{drop_from_high:.1f}%"
             elif pos.get_hold_time_minutes() >= TIME_STOP_MINUTES:
                 if -5 <= pos.pnl_percent <= 5:
                     reason = f"⏰ TIME STOP ({pos.get_hold_time_minutes():.0f}m)"
@@ -2220,7 +2062,7 @@ class PumpSniper:
                                     continue
 
                                 # Check the filters that might be blocking
-                                if token.change_5m < MIN_CHANGE_5M:
+                                if token.change_5m < 5.0:
                                     print(
                                         Fore.YELLOW + f"   ⏭️ {token.symbol}: 5m change too low ({token.change_5m:.1f}%)")
                                     continue
@@ -2228,28 +2070,16 @@ class PumpSniper:
                                     print(
                                         Fore.YELLOW + f"   ⏭️ {token.symbol}: 1h change negative ({token.change_1h:.1f}%)")
                                     continue
-                                if token.buy_pressure < MIN_BUY_PRESSURE:
+                                if token.buy_pressure < 0.60:
                                     print(
                                         Fore.YELLOW + f"   ⏭️ {token.symbol}: buy pressure low ({token.buy_pressure:.2f})")
                                     continue
-                                if token.change_5m > MAX_CHANGE_5M:
+                                if token.change_5m > 100:
                                     print(
                                         Fore.YELLOW + f"   ⏭️ {token.symbol}: pumped too much ({token.change_5m:.1f}%)")
                                     continue
-                                if token.volume_5m < MIN_VOLUME_5M:
-                                    print(
-                                        Fore.YELLOW + f"   ⏭️ {token.symbol}: volume too low (${token.volume_5m:.0f})")
-                                    continue
                                 if self.balance < 10:
                                     print(Fore.RED + f"   💸 Balance too low: ${self.balance:.2f}")
-                                    continue
-
-                                # Check MIN_SIGNALS_REQUIRED - need multiple confirming signals
-                                signals = self.insider.analyze_token(token, {})
-                                signal_count = signals.get('signal_count', 0)
-                                if signal_count < MIN_SIGNALS_REQUIRED:
-                                    print(
-                                        Fore.YELLOW + f"   ⏭️ {token.symbol}: not enough signals ({signal_count}/{MIN_SIGNALS_REQUIRED})")
                                     continue
 
                                 print(Fore.GREEN + f"   ✅ {token.symbol} passed filters, attempting buy...")
