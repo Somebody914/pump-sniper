@@ -66,7 +66,13 @@ STOP_LOSS_PERCENT = 5  # Cut losers faster
 TRAILING_STOP_PERCENT = 6
 TIME_STOP_MINUTES = 11
 
-# Dynamic Trailing Stops
+# Dynamic Trailing Stop Profit Thresholds
+PROFIT_THRESHOLD_MOON = 200    # 200%+ profit
+PROFIT_THRESHOLD_HUGE = 100    # 100-200% profit
+PROFIT_THRESHOLD_LARGE = 50    # 50-100% profit
+PROFIT_THRESHOLD_MEDIUM = 20   # 20-50% profit
+
+# Dynamic Trailing Stops (percentage drop from high allowed)
 TRAILING_STOP_SMALL = 10   # Under 20% profit
 TRAILING_STOP_MEDIUM = 7   # 20-50% profit
 TRAILING_STOP_LARGE = 5    # 50-100% profit
@@ -76,6 +82,13 @@ TRAILING_STOP_MOON = 3     # 200%+ profit
 # Momentum Protection
 MIN_BUY_PRESSURE_TO_HOLD = 0.70
 MOMENTUM_OVERRIDE_PROFIT = 30
+MOMENTUM_TRAILING_MULTIPLIER = 1.5  # Give 50% more room when momentum is strong
+
+# Market Cap Scoring Thresholds
+MCAP_PERFECT_LOW = 5000   # $5k
+MCAP_PERFECT_HIGH = 25000  # $25k - perfect entry range
+MCAP_GOOD_HIGH = 50000     # $50k - good entry
+MCAP_OK_HIGH = 100000      # $100k - okay entry
 
 # TIMING
 SCAN_INTERVAL = 3
@@ -842,13 +855,13 @@ class Position:
         return (time.time() - self.entry_time) / 60
 
     def get_dynamic_trailing_stop(self) -> float:
-        if self.pnl_percent >= 200:
+        if self.pnl_percent >= PROFIT_THRESHOLD_MOON:
             return TRAILING_STOP_MOON
-        elif self.pnl_percent >= 100:
+        elif self.pnl_percent >= PROFIT_THRESHOLD_HUGE:
             return TRAILING_STOP_HUGE
-        elif self.pnl_percent >= 50:
+        elif self.pnl_percent >= PROFIT_THRESHOLD_LARGE:
             return TRAILING_STOP_LARGE
-        elif self.pnl_percent >= 20:
+        elif self.pnl_percent >= PROFIT_THRESHOLD_MEDIUM:
             return TRAILING_STOP_MEDIUM
         else:
             return TRAILING_STOP_SMALL
@@ -1014,13 +1027,13 @@ class InsiderDetector:
 
         # 14. MARKET CAP SCORING
         if token.market_cap > 0:
-            if token.market_cap >= 5000 and token.market_cap < 25000:
+            if token.market_cap >= MCAP_PERFECT_LOW and token.market_cap < MCAP_PERFECT_HIGH:
                 signals['score'] += 30
                 signals['reasons'].append(f"💎 Perfect mcap ${token.market_cap / 1000:.0f}k")
-            elif token.market_cap >= 25000 and token.market_cap < 50000:
+            elif token.market_cap >= MCAP_PERFECT_HIGH and token.market_cap < MCAP_GOOD_HIGH:
                 signals['score'] += 20
                 signals['reasons'].append(f"✨ Good mcap ${token.market_cap / 1000:.0f}k")
-            elif token.market_cap >= 50000 and token.market_cap < 100000:
+            elif token.market_cap >= MCAP_GOOD_HIGH and token.market_cap < MCAP_OK_HIGH:
                 signals['score'] += 10
                 signals['reasons'].append(f"📊 OK mcap ${token.market_cap / 1000:.0f}k")
             elif token.market_cap > MAX_MARKET_CAP:
@@ -1759,7 +1772,7 @@ class PumpSniper:
 
                 # Momentum protection - don't sell if still pumping hard
                 if pos.pnl_percent >= MOMENTUM_OVERRIDE_PROFIT and pos.last_buy_ratio >= MIN_BUY_PRESSURE_TO_HOLD:
-                    trailing_stop = trailing_stop * 1.5  # Give 50% more room
+                    trailing_stop = trailing_stop * MOMENTUM_TRAILING_MULTIPLIER  # Give 50% more room
                     if drop_from_high >= trailing_stop:
                         reason = f"📉 MOMENTUM TRAIL -{drop_from_high:.1f}%"
                     else:
