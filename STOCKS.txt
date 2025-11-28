@@ -48,6 +48,7 @@ MIN_BUY_PRESSURE = 0.65
 MIN_VOLUME_5M = 500
 MIN_SIGNALS_REQUIRED = 2
 MAX_CHANGE_5M = 150
+LOW_BUY_PRESSURE_PENALTY_THRESHOLD = 0.45  # Penalize if buy pressure below this
 
 # Market Cap Filters
 MIN_MARKET_CAP = 5000  # $5k minimum
@@ -55,6 +56,9 @@ MAX_MARKET_CAP = 500000  # $500k maximum - above this already pumped
 IDEAL_MCAP_LOW = 10000  # $10k
 IDEAL_MCAP_HIGH = 50000  # $50k - sweet spot for pumps
 MAX_MCAP_LIQ_RATIO = 50  # Market cap shouldn't be more than 50x liquidity
+
+# Pump.fun Scanning
+PUMPFUN_COINS_LIMIT = 30  # Number of pump.fun coins to process
 
 # EXIT STRATEGY
 TAKE_PROFIT_PERCENT = 500  # Let moonshots ride!
@@ -989,7 +993,7 @@ class InsiderDetector:
             signals['score'] += 10
 
         # 10. PENALTY: Low buy pressure
-        if token.buy_pressure > 0 and token.buy_pressure < 0.45:
+        if token.buy_pressure > 0 and token.buy_pressure < LOW_BUY_PRESSURE_PENALTY_THRESHOLD:
             signals['score'] -= 20
             signals['reasons'].append(f"⚠️ Low buys {token.buy_pressure * 100:.0f}%")
 
@@ -1035,7 +1039,7 @@ class InsiderDetector:
             signal_count += 1
         if token.change_5m >= 10:
             signal_count += 1
-        if token.buy_pressure >= 0.65:
+        if token.buy_pressure >= MIN_BUY_PRESSURE:
             signal_count += 1
         signals['signal_count'] = signal_count
 
@@ -1556,7 +1560,7 @@ class PumpSniper:
             if r.status_code == 200:
                 coins = r.json()
                 scan_sources.append(f"PumpFun-New:{len(coins)}")
-                for coin in coins[:30]:  # Check more coins
+                for coin in coins[:PUMPFUN_COINS_LIMIT]:  # Check more coins
                     mint = coin.get('mint', '')
                     if mint:
                         # Get market cap from pump.fun data if available
@@ -1580,7 +1584,7 @@ class PumpSniper:
             if r.status_code == 200:
                 coins = r.json()
                 scan_sources.append(f"PumpFun-Active:{len(coins)}")
-                for coin in coins[:20]:
+                for coin in coins[:PUMPFUN_COINS_LIMIT]:
                     mint = coin.get('mint', '')
                     mcap = float(coin.get('usd_market_cap', 0) or 0)
                     # Look for coins with good market cap that are actively trading
