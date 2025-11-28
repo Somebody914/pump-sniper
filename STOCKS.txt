@@ -1006,7 +1006,7 @@ class InsiderDetector:
             signals['score'] += 10
 
         # 10. PENALTY: Low buy pressure
-        if token.buy_pressure > 0 and token.buy_pressure < LOW_BUY_PRESSURE_PENALTY_THRESHOLD:
+        if 0 < token.buy_pressure < LOW_BUY_PRESSURE_PENALTY_THRESHOLD:
             signals['score'] -= 20
             signals['reasons'].append(f"⚠️ Low buys {token.buy_pressure * 100:.0f}%")
 
@@ -1578,10 +1578,8 @@ class PumpSniper:
                     if mint:
                         # Get market cap from pump.fun data if available
                         mcap = float(coin.get('usd_market_cap', 0) or 0)
-                        if mcap > 0 and mcap < MAX_MARKET_CAP:
-                            p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
-                            all_pairs.extend(p[:2])
-                        elif mcap == 0:  # No mcap data, still check it
+                        # Fetch if no mcap data OR if mcap is in valid range
+                        if mcap == 0 or mcap < MAX_MARKET_CAP:
                             p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
                             all_pairs.extend(p[:2])
                         time.sleep(0.1)
@@ -1772,7 +1770,8 @@ class PumpSniper:
 
                 # Momentum protection - don't sell if still pumping hard
                 if pos.pnl_percent >= MOMENTUM_OVERRIDE_PROFIT and pos.last_buy_ratio >= MIN_BUY_PRESSURE_TO_HOLD:
-                    trailing_stop = trailing_stop * MOMENTUM_TRAILING_MULTIPLIER  # Give 50% more room
+                    # Widen trailing stop when momentum is strong
+                    trailing_stop = trailing_stop * MOMENTUM_TRAILING_MULTIPLIER
                     if drop_from_high >= trailing_stop:
                         reason = f"📉 MOMENTUM TRAIL -{drop_from_high:.1f}%"
                     else:
