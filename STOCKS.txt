@@ -10,6 +10,17 @@ import webbrowser
 import asyncio
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# WEBSOCKET IMPORTS - For bypassing Cloudflare blocks on Pump.fun API
+# pip install websocket-client
+# ═══════════════════════════════════════════════════════════════════════════════
+try:
+    import websocket
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
+    print("⚠️ websocket-client not installed. Run: pip install websocket-client")
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # REAL TRADING IMPORTS - Install with:
 # pip install solana solders httpx base58 --break-system-packages
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -133,6 +144,14 @@ else:
 JUPITER_QUOTE_API = "https://lite-api.jup.ag/swap/v1/quote"
 JUPITER_SWAP_API = "https://lite-api.jup.ag/swap/v1/swap"
 PUMPPORTAL_API = "https://pumpportal.fun/api/trade-local"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PUMP.FUN WEBSOCKET CONFIGURATION - Bypasses Cloudflare blocking!
+# ═══════════════════════════════════════════════════════════════════════════════
+PUMPFUN_WS_URL = "wss://pumpportal.fun/api/data"
+PUMPFUN_WS_ALT = "wss://client-api-2-74b1891ee9f9.herokuapp.com/socket.io/?EIO=4&transport=websocket"
+PUMPFUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"  # Pump.fun program ID
+BIRDEYE_API = "https://public-api.birdeye.so"
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 SLIPPAGE_BPS = 250  # 2.5% slippage for buys (was 10% - way too high!)
@@ -1060,6 +1079,105 @@ class InsiderDetector:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# PUMPFUN WEBSOCKET CLIENT - Bypasses Cloudflare blocking!
+# ═══════════════════════════════════════════════════════════════════════════════
+class PumpFunWebSocket:
+    """Connect to Pump.fun via WebSocket to get real-time token data"""
+
+    def __init__(self):
+        self.ws = None
+        self.tokens = []
+        self.connected = False
+        self.lock = threading.Lock()
+        self.connect_event = threading.Event()
+        self._thread = None
+
+    def on_message(self, ws, message):
+        """Handle incoming WebSocket messages"""
+        try:
+            # Parse the message
+            if message.startswith('0'):  # Socket.io connect
+                return
+            if message.startswith('40'):  # Socket.io connected
+                self.connected = True
+                self.connect_event.set()
+                # Subscribe to new tokens
+                ws.send('42["subscribe",{"type":"newTokens"}]')
+                ws.send('42["subscribe",{"type":"tradeCreated"}]')
+                return
+            if message.startswith('42'):  # Socket.io message
+                data = json.loads(message[2:])
+                if len(data) >= 2:
+                    event_type = data[0]
+                    event_data = data[1]
+
+                    if event_type in ['newToken', 'tokenCreated', 'create']:
+                        with self.lock:
+                            self.tokens.append(event_data)
+                            if len(self.tokens) > 100:
+                                self.tokens = self.tokens[-100:]
+
+                    elif event_type in ['tradeCreated', 'trade']:
+                        # Could track trades for volume data
+                        pass
+        except json.JSONDecodeError:
+            # Ignore malformed JSON messages (common with socket.io protocol)
+            pass
+        except Exception:
+            # Silently ignore other parsing errors to prevent spam during normal operation
+            pass
+
+    def on_error(self, ws, error):
+        print(Fore.RED + f"   WebSocket error: {error}")
+
+    def on_close(self, ws, close_status_code, close_msg):
+        self.connected = False
+        self.connect_event.clear()
+        print(Fore.YELLOW + f"   WebSocket closed")
+
+    def on_open(self, ws):
+        print(Fore.GREEN + f"   ✓ WebSocket connected!")
+        self.connected = True
+        self.connect_event.set()
+
+    def connect(self):
+        """Connect to Pump.fun WebSocket"""
+        try:
+            self.connect_event.clear()
+            self.ws = websocket.WebSocketApp(
+                PUMPFUN_WS_URL,
+                on_open=self.on_open,
+                on_message=self.on_message,
+                on_error=self.on_error,
+                on_close=self.on_close
+            )
+
+            # Run in background thread
+            self._thread = threading.Thread(target=self.ws.run_forever)
+            self._thread.daemon = True
+            self._thread.start()
+
+            # Wait for connection with timeout using threading.Event
+            connection_established = self.connect_event.wait(timeout=5)
+            return connection_established and self.connected
+        except Exception as e:
+            print(Fore.RED + f"   WebSocket connect error: {e}")
+            return False
+
+    def get_recent_tokens(self):
+        """Get recently seen tokens"""
+        with self.lock:
+            return list(self.tokens)
+
+    def close(self):
+        """Gracefully close the WebSocket connection"""
+        if self.ws:
+            self.ws.close()
+        self.connected = False
+        self.connect_event.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN BOT CLASS - WITH FIXES
 # ═══════════════════════════════════════════════════════════════════════════════
 class PumpSniper:
@@ -1081,6 +1199,22 @@ class PumpSniper:
         # NEW: Track pending buys to prevent double-execution
         # ═══════════════════════════════════════════════════════════════════
         self.pending_buys: dict[str, float] = {}  # unique_id -> timestamp
+
+        # ═══════════════════════════════════════════════════════════════════
+        # WEBSOCKET: Connect to Pump.fun WebSocket for real-time token data
+        # ═══════════════════════════════════════════════════════════════════
+        self.pumpfun_ws = None
+        if WEBSOCKET_AVAILABLE:
+            try:
+                self.pumpfun_ws = PumpFunWebSocket()
+                if self.pumpfun_ws.connect():
+                    print(Fore.GREEN + "✅ Connected to Pump.fun WebSocket")
+                else:
+                    print(Fore.YELLOW + "⚠️ WebSocket connection failed, using fallbacks")
+            except Exception as e:
+                print(Fore.RED + f"⚠️ WebSocket error: {e}")
+        else:
+            print(Fore.YELLOW + "⚠️ WebSocket not available, using fallback APIs")
 
         # Real trading initialization
         self.real_trader = None
@@ -1515,6 +1649,92 @@ class PumpSniper:
             score += 10
         return score
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ALTERNATIVE DATA SOURCES - When Pump.fun REST API is blocked
+    # ═══════════════════════════════════════════════════════════════════════════
+    def scan_via_helius(self):
+        """Scan for new Pump.fun tokens via Helius API"""
+        if not HELIUS_API_KEY or len(HELIUS_API_KEY) < 10:
+            return []
+
+        try:
+            url = f"https://api.helius.xyz/v0/addresses/{PUMPFUN_PROGRAM}/transactions?api-key={HELIUS_API_KEY}&limit=50"
+            r = requests.get(url, timeout=15)
+            if r.status_code == 200:
+                txs = r.json()
+                print(Fore.GREEN + f"   ✓ Got {len(txs)} Pump.fun transactions from Helius")
+
+                tokens = []
+                seen_mints = set()  # Use set for O(1) lookup instead of O(n) list search
+                for tx in txs:
+                    # Extract token mints from transaction data
+                    try:
+                        # Look for token account changes that indicate new mints
+                        token_balances = tx.get('tokenTransfers', [])
+                        for transfer in token_balances:
+                            mint = transfer.get('mint', '')
+                            if mint and mint not in seen_mints:
+                                seen_mints.add(mint)
+                                tokens.append({'mint': mint, 'source': 'helius'})
+                    except Exception:
+                        continue
+                return tokens
+        except Exception as e:
+            print(Fore.RED + f"   Helius error: {e}")
+        return []
+
+    def scan_via_birdeye(self):
+        """Scan for new Solana tokens via Birdeye"""
+        try:
+            headers = {
+                'Accept': 'application/json',
+                'x-chain': 'solana'
+            }
+
+            # Get new tokens
+            url = f"{BIRDEYE_API}/defi/tokenlist?sort_by=created_at&sort_type=desc&limit=50"
+            r = requests.get(url, headers=headers, timeout=15)
+
+            if r.status_code == 200:
+                data = r.json()
+                tokens = data.get('data', {}).get('tokens', [])
+                print(Fore.GREEN + f"   ✓ Got {len(tokens)} tokens from Birdeye")
+                return tokens
+        except Exception as e:
+            print(Fore.RED + f"   Birdeye error: {e}")
+        return []
+
+    def scan_via_jupiter(self):
+        """Get tokens from Jupiter (works reliably)"""
+        try:
+            # Jupiter strict token list - verified tokens
+            url = "https://token.jup.ag/strict"
+            r = requests.get(url, timeout=15)
+            if r.status_code == 200:
+                tokens = r.json()
+                # Filter for tokens with 'pump' in tags (pump.fun tokens)
+                recent = [t for t in tokens if 'pump' in t.get('tags', [])]
+                print(Fore.GREEN + f"   ✓ Got {len(recent)} pump tokens from Jupiter")
+                return recent
+        except Exception as e:
+            print(Fore.RED + f"   Jupiter error: {e}")
+        return []
+
+    def process_pumpfun_coin(self, coin_data):
+        """Process a token from WebSocket or alternative sources"""
+        try:
+            mint = coin_data.get('mint', '') or coin_data.get('address', '')
+            if not mint:
+                return None
+
+            # Fetch pair data from DexScreener
+            pairs = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
+            if pairs:
+                return pairs[:2]  # Return up to 2 pairs
+            return None
+        except Exception:
+            return None
+
     def scan_for_pumps(self):
         self.scanning = True
         self.stats['last_scan'] = datetime.datetime.now().strftime('%H:%M:%S')
@@ -1563,8 +1783,23 @@ class PumpSniper:
                 pass
         scan_sources.append(f"Search:{len(hot_terms)}terms")
 
-        # 4. PUMP.FUN - Enhanced scanning for fresh launches
-        # Scan Pump.fun NEW coins
+        # 4. PUMP.FUN - Uses WebSocket + fallback sources (REST API is Cloudflare blocked)
+        pumpfun_tokens_count = 0
+
+        # Method 1: WebSocket (real-time, bypasses Cloudflare!)
+        if self.pumpfun_ws and self.pumpfun_ws.connected:
+            ws_tokens = self.pumpfun_ws.get_recent_tokens()
+            if ws_tokens:
+                scan_sources.append(f"PumpFun-WS:{len(ws_tokens)}")
+                for token_data in ws_tokens[:PUMPFUN_COINS_LIMIT]:
+                    pairs_result = self.process_pumpfun_coin(token_data)
+                    if pairs_result:
+                        all_pairs.extend(pairs_result)
+                        pumpfun_tokens_count += 1
+                        time.sleep(0.1)
+
+        # Method 2: Try REST API (may be Cloudflare blocked - 530 error)
+        pumpfun_api_worked = False
         try:
             r = requests.get(
                 "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=desc",
@@ -1573,20 +1808,56 @@ class PumpSniper:
             if r.status_code == 200:
                 coins = r.json()
                 scan_sources.append(f"PumpFun-New:{len(coins)}")
-                for coin in coins[:PUMPFUN_COINS_LIMIT]:  # Check more coins
+                pumpfun_api_worked = True
+                for coin in coins[:PUMPFUN_COINS_LIMIT]:
                     mint = coin.get('mint', '')
                     if mint:
-                        # Get market cap from pump.fun data if available
                         mcap = float(coin.get('usd_market_cap', 0) or 0)
-                        # Fetch if no mcap data OR if mcap is in valid range
                         if mcap == 0 or mcap < MAX_MARKET_CAP:
                             p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
                             all_pairs.extend(p[:2])
                         time.sleep(0.1)
-        except:
-            pass
+            elif r.status_code == 530:
+                print(Fore.YELLOW + "   ⚠️ Pump.fun API blocked (530 Cloudflare), using alternatives...")
+        except Exception as e:
+            if "530" in str(e) or "cloudflare" in str(e).lower():
+                print(Fore.YELLOW + "   ⚠️ Pump.fun API blocked by Cloudflare, using alternatives...")
 
-        # Scan Pump.fun GRADUATING/ACTIVE coins (about to hit Raydium - high potential!)
+        # If WebSocket didn't get many tokens and REST failed, use fallback sources
+        if pumpfun_tokens_count < 10 and not pumpfun_api_worked:
+            # Method 3: Helius API (if available)
+            helius_tokens = self.scan_via_helius()
+            if helius_tokens:
+                scan_sources.append(f"Helius:{len(helius_tokens)}")
+                for token_data in helius_tokens[:20]:
+                    pairs_result = self.process_pumpfun_coin(token_data)
+                    if pairs_result:
+                        all_pairs.extend(pairs_result)
+                        time.sleep(0.1)
+
+            # Method 4: Birdeye API
+            birdeye_tokens = self.scan_via_birdeye()
+            if birdeye_tokens:
+                scan_sources.append(f"Birdeye:{len(birdeye_tokens)}")
+                for token_data in birdeye_tokens[:20]:
+                    mint = token_data.get('address', '') or token_data.get('mint', '')
+                    if mint:
+                        p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
+                        all_pairs.extend(p[:2])
+                        time.sleep(0.1)
+
+            # Method 5: Jupiter API (verified pump tokens)
+            jupiter_tokens = self.scan_via_jupiter()
+            if jupiter_tokens:
+                scan_sources.append(f"Jupiter:{len(jupiter_tokens)}")
+                for token_data in jupiter_tokens[:15]:
+                    mint = token_data.get('address', '')
+                    if mint:
+                        p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
+                        all_pairs.extend(p[:2])
+                        time.sleep(0.1)
+
+        # Try active Pump.fun coins (may also be blocked)
         try:
             r = requests.get(
                 "https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=last_trade_timestamp&order=desc",
@@ -1598,7 +1869,6 @@ class PumpSniper:
                 for coin in coins[:PUMPFUN_COINS_LIMIT]:
                     mint = coin.get('mint', '')
                     mcap = float(coin.get('usd_market_cap', 0) or 0)
-                    # Look for coins with good market cap that are actively trading
                     if mint and (mcap == 0 or (mcap > MIN_MARKET_CAP and mcap < MAX_MARKET_CAP)):
                         p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
                         all_pairs.extend(p[:2])
@@ -2552,6 +2822,15 @@ class PumpSniper:
         print(f"  Total Calls:      {self.stats['api_calls']:,}")
         print(f"  API Errors:       {self.stats['api_errors']:,}")
         print(f"  Tokens Scanned:   {self.stats['total_scanned']:,}")
+
+        print(Fore.GREEN + "\n🔌 WEBSOCKET STATUS:")
+        ws_status = "Connected" if (self.pumpfun_ws and self.pumpfun_ws.connected) else "Not Connected"
+        ws_available = "Yes" if WEBSOCKET_AVAILABLE else "No (pip install websocket-client)"
+        print(f"  WebSocket Lib:    {ws_available}")
+        print(f"  Pump.fun WS:      {ws_status}")
+        if self.pumpfun_ws and self.pumpfun_ws.connected:
+            tokens_cached = len(self.pumpfun_ws.get_recent_tokens())
+            print(f"  Tokens Cached:    {tokens_cached}")
 
         # Show realistic paper trading fee settings
         if PAPER_TRADE:
