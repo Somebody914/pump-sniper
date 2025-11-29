@@ -134,6 +134,25 @@ JUPITER_QUOTE_API = "https://lite-api.jup.ag/swap/v1/quote"
 JUPITER_SWAP_API = "https://lite-api.jup.ag/swap/v1/swap"
 PUMPPORTAL_API = "https://pumpportal.fun/api/trade-local"
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# PUMP.FUN API ENDPOINTS - Multiple fallbacks for reliability
+# ═══════════════════════════════════════════════════════════════════════════════
+PUMPFUN_API_BASE = "https://client-api-2-74b1891ee9f9.herokuapp.com"
+PUMPFUN_NEW_COINS = f"{PUMPFUN_API_BASE}/coins?offset=0&limit=50&sort=created_timestamp&order=desc&includeNsfw=false"
+PUMPFUN_TOP_COINS = f"{PUMPFUN_API_BASE}/coins?offset=0&limit=50&sort=market_cap&order=desc&includeNsfw=false"
+PUMPFUN_LATEST_TRADES = f"{PUMPFUN_API_BASE}/trades/latest"
+PUMPFUN_FRONTEND_API = "https://frontend-api.pump.fun/coins"
+PUMPFUN_PUBLIC_API = "https://pump.fun/api/coins"
+
+# HTTP Headers for API requests (prevents blocking)
+API_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Origin': 'https://pump.fun',
+    'Referer': 'https://pump.fun/'
+}
+
 SOL_MINT = "So11111111111111111111111111111111111111112"
 SLIPPAGE_BPS = 250  # 2.5% slippage for buys (was 10% - way too high!)
 SELL_SLIPPAGE_BPS = 400  # 4% slippage for sells (was 12%)
@@ -1170,6 +1189,9 @@ class PumpSniper:
             Fore.RED + f"🎯 Targets: +{TAKE_PROFIT_PERCENT}% TP | -{STOP_LOSS_PERCENT}% SL | {TRAILING_STOP_PERCENT}% Trail")
         print()
 
+        # Test APIs on startup
+        self.test_apis()
+
     def print_banner(self):
         print()
         print(Fore.RED + Style.BRIGHT + "╔" + "═" * 74 + "╗")
@@ -1183,6 +1205,54 @@ class PumpSniper:
         print(Fore.RED + Style.BRIGHT + "╚" + "═" * 74 + "╝")
         print(Fore.YELLOW + f"⏰ {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print()
+
+    def test_apis(self):
+        """Test if Pump.fun APIs are responding"""
+        print(Fore.YELLOW + "🔍 Testing Pump.fun APIs...")
+
+        # Test 1: Client API (Heroku) - primary endpoint
+        try:
+            url = f"{PUMPFUN_API_BASE}/coins?offset=0&limit=10&sort=created_timestamp&order=desc&includeNsfw=false"
+            print(Fore.CYAN + f"   Testing: {url[:60]}...")
+            r = requests.get(url, headers=API_HEADERS, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                count = len(data) if isinstance(data, list) else 0
+                print(Fore.GREEN + f"   ✓ Client API: Status {r.status_code} - Got {count} coins")
+            else:
+                print(Fore.RED + f"   ✗ Client API: Status {r.status_code}")
+        except Exception as e:
+            print(Fore.RED + f"   ✗ Client API FAILED: {e}")
+
+        # Test 2: Frontend API - fallback
+        try:
+            url = f"{PUMPFUN_FRONTEND_API}?offset=0&limit=10&sort=created_timestamp&order=desc"
+            print(Fore.CYAN + f"   Testing: {url[:60]}...")
+            r = requests.get(url, headers=API_HEADERS, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                count = len(data) if isinstance(data, list) else 0
+                print(Fore.GREEN + f"   ✓ Frontend API: Status {r.status_code} - Got {count} coins")
+            else:
+                print(Fore.YELLOW + f"   ⚠ Frontend API: Status {r.status_code}")
+        except Exception as e:
+            print(Fore.RED + f"   ✗ Frontend API FAILED: {e}")
+
+        # Test 3: DexScreener API - always reliable
+        try:
+            url = "https://api.dexscreener.com/token-boosts/top/v1"
+            print(Fore.CYAN + f"   Testing: {url}...")
+            r = requests.get(url, headers=API_HEADERS, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                count = len(data) if isinstance(data, list) else 0
+                print(Fore.GREEN + f"   ✓ DexScreener API: Status {r.status_code} - Got {count} tokens")
+            else:
+                print(Fore.RED + f"   ✗ DexScreener API: Status {r.status_code}")
+        except Exception as e:
+            print(Fore.RED + f"   ✗ DexScreener API FAILED: {e}")
+
+        print(Fore.YELLOW + "   API test complete.\n")
 
     def load_state(self):
         try:
@@ -1295,10 +1365,12 @@ class PumpSniper:
             print(Fore.RED + f"☠️ Marked dead: {pair_id[:20]}... - {reason}")
 
     def check_pair_status(self, chain: str, pair_address: str) -> tuple[str, dict | None]:
+        """Check if a trading pair is still active with proper headers"""
         try:
             self.stats['api_calls'] += 1
             r = requests.get(
                 f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_address}",
+                headers=API_HEADERS,
                 timeout=8
             )
             if r.status_code == 404:
@@ -1413,9 +1485,10 @@ class PumpSniper:
         return False, ""
 
     def fetch_pairs(self, url: str) -> list:
+        """Fetch pairs from DexScreener API with proper headers"""
         try:
             self.stats['api_calls'] += 1
-            r = requests.get(url, timeout=10)
+            r = requests.get(url, headers=API_HEADERS, timeout=10)
             if r.status_code == 429:
                 time.sleep(3)
                 return []
@@ -1515,16 +1588,199 @@ class PumpSniper:
             score += 10
         return score
 
+    def process_pumpfun_coin(self, coin: dict) -> Token | None:
+        """Process a single pump.fun coin directly from their API"""
+        try:
+            mint = coin.get('mint', '')
+            if not mint:
+                return None
+
+            symbol = coin.get('symbol', '???')[:12]
+            name = coin.get('name', 'Unknown')[:30]
+            mcap = float(coin.get('usd_market_cap', 0) or coin.get('market_cap', 0) or 0)
+            created = coin.get('created_timestamp', 0)
+            replies = int(coin.get('reply_count', 0) or 0)
+
+            # Calculate age
+            if created:
+                age_mins = (time.time() * 1000 - created) / (1000 * 60)
+            else:
+                age_mins = 999
+
+            unique_id = f"solana_{mint}"
+
+            # Skip if already tracking
+            if unique_id in self.hot_tokens:
+                return None
+            if self.is_token_dead(unique_id):
+                return None
+
+            # Simple scoring for pump.fun coins
+            score = 0
+            reasons = []
+
+            # Age scoring - fresher is better
+            if age_mins < 5:
+                score += 60
+                reasons.append(f"🆕 {age_mins:.0f}m FRESH!")
+            elif age_mins < 15:
+                score += 40
+                reasons.append(f"🆕 {age_mins:.0f}m old")
+            elif age_mins < 60:
+                score += 20
+                reasons.append(f"⏰ {age_mins:.0f}m")
+
+            # Market cap scoring
+            if 5000 <= mcap <= 30000:
+                score += 50
+                reasons.append(f"💎 ${mcap/1000:.0f}k perfect!")
+            elif 30000 < mcap <= 80000:
+                score += 40
+                reasons.append(f"💰 ${mcap/1000:.0f}k")
+            elif mcap > 80000:
+                score += 20
+                reasons.append(f"📊 ${mcap/1000:.0f}k")
+
+            # Replies scoring - social engagement
+            if replies >= 50:
+                score += 30
+                reasons.append(f"🔥 {replies} replies")
+            elif replies >= 20:
+                score += 15
+                reasons.append(f"💬 {replies} replies")
+
+            # Must have minimum score
+            if score < 40:
+                return None
+
+            # Estimate liquidity from market cap (pump.fun typically has ~10% liq)
+            est_liquidity = mcap * 0.1 if mcap > 0 else 1000
+
+            # Create token
+            token = Token(
+                symbol=symbol,
+                name=name,
+                chain='solana',
+                contract=mint,
+                pair_address=mint,
+                price=mcap / 1000000000 if mcap > 0 else 0.000001,
+                market_cap=mcap,
+                liquidity=est_liquidity,
+                age_minutes=age_mins,
+                dex_url=f"https://pump.fun/{mint}",
+                insider_score=score,
+                alert_reasons=reasons,
+                buy_pressure=0.7
+            )
+
+            return token
+
+        except Exception as e:
+            print(Fore.RED + f"   Error processing pump.fun coin: {e}")
+            return None
+
     def scan_for_pumps(self):
+        """Scan for new pump.fun tokens - FIXED with working APIs and proper headers"""
         self.scanning = True
         self.stats['last_scan'] = datetime.datetime.now().strftime('%H:%M:%S')
 
         all_pairs = []
         scan_sources = []
+        pumpfun_coins = []  # Track coins directly from pump.fun
 
-        # 1. TOKEN PROFILES
+        # ═══════════════════════════════════════════════════════════════════
+        # 1. PUMP.FUN - DIRECT API CALLS WITH FALLBACKS
+        # ═══════════════════════════════════════════════════════════════════
+        print(Fore.CYAN + f"[{self.stats['last_scan']}] 📡 Fetching Pump.fun tokens...")
+
+        # Method 1: Try the client API (most reliable)
         try:
-            r = requests.get("https://api.dexscreener.com/token-boosts/top/v1", timeout=8)
+            url = PUMPFUN_NEW_COINS
+            print(Fore.CYAN + f"   → Trying Client API: {url[:50]}...")
+            r = requests.get(url, headers=API_HEADERS, timeout=15)
+            print(Fore.CYAN + f"   → Client API: Status {r.status_code}")
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and len(data) > 0:
+                    pumpfun_coins.extend(data)
+                    scan_sources.append(f"PumpClient:{len(data)}")
+                    print(Fore.GREEN + f"   ✓ Got {len(data)} coins from Client API")
+        except Exception as e:
+            print(Fore.RED + f"   ✗ Client API error: {e}")
+            self.stats['api_errors'] += 1
+
+        # Method 2: Try top coins by market cap
+        if len(pumpfun_coins) < 20:
+            try:
+                url = PUMPFUN_TOP_COINS
+                print(Fore.CYAN + f"   → Trying Top Coins API: {url[:50]}...")
+                r = requests.get(url, headers=API_HEADERS, timeout=15)
+                print(Fore.CYAN + f"   → Top Coins API: Status {r.status_code}")
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        # Only add coins we don't already have
+                        existing_mints = {c.get('mint') for c in pumpfun_coins}
+                        new_coins = [c for c in data if c.get('mint') not in existing_mints]
+                        pumpfun_coins.extend(new_coins)
+                        scan_sources.append(f"PumpTop:{len(new_coins)}")
+                        print(Fore.GREEN + f"   ✓ Got {len(new_coins)} new coins from Top API")
+            except Exception as e:
+                print(Fore.RED + f"   ✗ Top Coins API error: {e}")
+                self.stats['api_errors'] += 1
+
+        # Method 3: Try frontend API as fallback
+        if len(pumpfun_coins) < 10:
+            try:
+                url = f"{PUMPFUN_FRONTEND_API}?offset=0&limit=50&sort=created_timestamp&order=desc"
+                print(Fore.CYAN + f"   → Trying Frontend API: {url[:50]}...")
+                r = requests.get(url, headers=API_HEADERS, timeout=15)
+                print(Fore.CYAN + f"   → Frontend API: Status {r.status_code}")
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        existing_mints = {c.get('mint') for c in pumpfun_coins}
+                        new_coins = [c for c in data if c.get('mint') not in existing_mints]
+                        pumpfun_coins.extend(new_coins)
+                        scan_sources.append(f"PumpFrontend:{len(new_coins)}")
+                        print(Fore.GREEN + f"   ✓ Got {len(new_coins)} coins from Frontend API")
+            except Exception as e:
+                print(Fore.RED + f"   ✗ Frontend API error: {e}")
+                self.stats['api_errors'] += 1
+
+        # Process pump.fun coins directly and also fetch from DexScreener
+        pumpfun_processed = 0
+        for coin in pumpfun_coins[:40]:
+            mint = coin.get('mint', '')
+            if mint:
+                # First: process directly from pump.fun data for quick signals
+                token = self.process_pumpfun_coin(coin)
+                if token:
+                    uid = token.get_unique_id()
+                    if not self.is_token_dead(uid) and uid not in self.hot_tokens:
+                        self.hot_tokens[uid] = token
+                        pumpfun_processed += 1
+                        print(Fore.GREEN + f"   ✓ {token.symbol} - Score: {token.insider_score:.0f} - {token.alert_reasons[0] if token.alert_reasons else ''}")
+
+                # Also fetch DexScreener data for more detailed analysis
+                mcap = float(coin.get('usd_market_cap', 0) or 0)
+                if mcap == 0 or mcap < MAX_MARKET_CAP:
+                    p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
+                    all_pairs.extend(p[:2])
+                time.sleep(0.1)
+
+        if pumpfun_processed > 0:
+            print(Fore.GREEN + f"   📊 Processed {pumpfun_processed} coins from Pump.fun directly")
+
+        if not pumpfun_coins:
+            print(Fore.RED + "   ❌ ALL PUMP.FUN APIs FAILED - No coins fetched!")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 2. DEXSCREENER - TOKEN PROFILES
+        # ═══════════════════════════════════════════════════════════════════
+        try:
+            url = "https://api.dexscreener.com/token-boosts/top/v1"
+            r = requests.get(url, headers=API_HEADERS, timeout=8)
             if r.status_code == 200:
                 boosted = r.json()
                 scan_sources.append(f"Boosted:{len(boosted)}")
@@ -1535,11 +1791,13 @@ class PumpSniper:
                         all_pairs.extend(p[:3])
                         time.sleep(0.15)
         except Exception as e:
-            print(Fore.RED + f"Boost fetch error: {e}")
+            print(Fore.RED + f"   Boost fetch error: {e}")
+            self.stats['api_errors'] += 1
 
-        # 2. LATEST TOKEN PROFILES
+        # 3. LATEST TOKEN PROFILES
         try:
-            r = requests.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=8)
+            url = "https://api.dexscreener.com/token-profiles/latest/v1"
+            r = requests.get(url, headers=API_HEADERS, timeout=8)
             if r.status_code == 200:
                 latest = r.json()
                 scan_sources.append(f"Latest:{len(latest)}")
@@ -1550,9 +1808,10 @@ class PumpSniper:
                         all_pairs.extend(p[:2])
                         time.sleep(0.15)
         except Exception as e:
-            print(Fore.RED + f"Latest fetch error: {e}")
+            print(Fore.RED + f"   Latest fetch error: {e}")
+            self.stats['api_errors'] += 1
 
-        # 3. SEARCH HOT TERMS
+        # 4. SEARCH HOT TERMS
         hot_terms = ['pump', 'moon', 'pepe', 'doge', 'shib', 'ape', 'wojak', 'chad', 'based', 'send']
         for term in hot_terms:
             try:
@@ -1563,49 +1822,6 @@ class PumpSniper:
                 pass
         scan_sources.append(f"Search:{len(hot_terms)}terms")
 
-        # 4. PUMP.FUN - Enhanced scanning for fresh launches
-        # Scan Pump.fun NEW coins
-        try:
-            r = requests.get(
-                "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=desc",
-                timeout=8
-            )
-            if r.status_code == 200:
-                coins = r.json()
-                scan_sources.append(f"PumpFun-New:{len(coins)}")
-                for coin in coins[:PUMPFUN_COINS_LIMIT]:  # Check more coins
-                    mint = coin.get('mint', '')
-                    if mint:
-                        # Get market cap from pump.fun data if available
-                        mcap = float(coin.get('usd_market_cap', 0) or 0)
-                        # Fetch if no mcap data OR if mcap is in valid range
-                        if mcap == 0 or mcap < MAX_MARKET_CAP:
-                            p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
-                            all_pairs.extend(p[:2])
-                        time.sleep(0.1)
-        except:
-            pass
-
-        # Scan Pump.fun GRADUATING/ACTIVE coins (about to hit Raydium - high potential!)
-        try:
-            r = requests.get(
-                "https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=last_trade_timestamp&order=desc",
-                timeout=8
-            )
-            if r.status_code == 200:
-                coins = r.json()
-                scan_sources.append(f"PumpFun-Active:{len(coins)}")
-                for coin in coins[:PUMPFUN_COINS_LIMIT]:
-                    mint = coin.get('mint', '')
-                    mcap = float(coin.get('usd_market_cap', 0) or 0)
-                    # Look for coins with good market cap that are actively trading
-                    if mint and (mcap == 0 or (mcap > MIN_MARKET_CAP and mcap < MAX_MARKET_CAP)):
-                        p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
-                        all_pairs.extend(p[:2])
-                        time.sleep(0.1)
-        except:
-            pass
-
         # 5. CHAIN SEARCHES
         for chain in ['solana', 'base', 'bsc']:
             try:
@@ -1615,13 +1831,13 @@ class PumpSniper:
             except:
                 pass
 
-        # ANALYZE
-        self.hot_tokens = {}
+        # ═══════════════════════════════════════════════════════════════════
+        # ANALYZE ALL PAIRS FROM DEXSCREENER
+        # ═══════════════════════════════════════════════════════════════════
         seen = set()
         new_tokens = 0
         vol_spikes = 0
         whale_buys = 0
-        signals = 0
         parsed = 0
 
         for pair in all_pairs:
@@ -1673,8 +1889,9 @@ class PumpSniper:
                     not self.is_holding(uid) and
                     not self.is_pending_buy(uid)):  # NEW: Check pending buys
                 self.hot_tokens[uid] = token
-                signals += 1
 
+        # Update stats
+        signals = len(self.hot_tokens)
         self.stats['total_scanned'] += parsed
         self.stats['insider_signals'] = signals
         self.stats['new_tokens_found'] = new_tokens
