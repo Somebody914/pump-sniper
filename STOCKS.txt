@@ -1,3 +1,8 @@
+# ════════════════════════════════════════════════════════════════════════════════
+# REQUIRED: Install pumpfun library before running
+# pip install pumpfun
+# ════════════════════════════════════════════════════════════════════════════════
+
 import requests
 import time
 from colorama import Fore, Style, init
@@ -8,6 +13,17 @@ from dataclasses import dataclass, field
 import os
 import webbrowser
 import asyncio
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PUMPFUN LIBRARY IMPORTS - Install with:
+# pip install pumpfun
+# ═══════════════════════════════════════════════════════════════════════════════
+try:
+    import pumpfun
+    PUMPFUN_LIB_AVAILABLE = True
+except ImportError:
+    PUMPFUN_LIB_AVAILABLE = False
+    print("⚠️ pumpfun library not installed. Run: pip install pumpfun")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # REAL TRADING IMPORTS - Install with:
@@ -1082,6 +1098,15 @@ class PumpSniper:
         # ═══════════════════════════════════════════════════════════════════
         self.pending_buys: dict[str, float] = {}  # unique_id -> timestamp
 
+        # ═══════════════════════════════════════════════════════════════════
+        # PUMPFUN LIBRARY INITIALIZATION
+        # ═══════════════════════════════════════════════════════════════════
+        self.pumpfun_available = PUMPFUN_LIB_AVAILABLE
+        if self.pumpfun_available:
+            print(Fore.GREEN + "✅ PumpFun library available")
+        else:
+            print(Fore.YELLOW + "⚠️ PumpFun library not available - install with: pip install pumpfun")
+
         # Real trading initialization
         self.real_trader = None
         if not PAPER_TRADE:
@@ -1151,7 +1176,8 @@ class PumpSniper:
             'momentum_saves': 0,
             'filtered_out': 0,
             'low_mcap_skipped': 0,
-            'high_mcap_skipped': 0
+            'high_mcap_skipped': 0,
+            'pumpfun_tokens': 0  # Track tokens from pumpfun library
         }
 
         self.running = True
@@ -1295,8 +1321,28 @@ class PumpSniper:
             print(Fore.RED + f"☠️ Marked dead: {pair_id[:20]}... - {reason}")
 
     def check_pair_status(self, chain: str, pair_address: str) -> tuple[str, dict | None]:
+        """Check token status - uses pumpfun library for Solana tokens"""
         try:
             self.stats['api_calls'] += 1
+
+            # ═══════════════════════════════════════════════════════════════
+            # Try pumpfun library first for Solana tokens
+            # ═══════════════════════════════════════════════════════════════
+            if chain == 'solana' and self.pumpfun_available:
+                try:
+                    token_data = pumpfun.get_coin(pair_address)
+                    if token_data:
+                        if isinstance(token_data, dict):
+                            mcap = float(token_data.get('market_cap', 0) or token_data.get('usd_market_cap', 0) or 0)
+                            if mcap < 1000:
+                                return 'dead', token_data
+                            return 'active', token_data
+                except Exception:
+                    pass  # Fall through to DEXScreener
+
+            # ═══════════════════════════════════════════════════════════════
+            # Fallback to DEXScreener
+            # ═══════════════════════════════════════════════════════════════
             r = requests.get(
                 f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_address}",
                 timeout=8
@@ -1516,11 +1562,124 @@ class PumpSniper:
         return score
 
     def scan_for_pumps(self):
+        """Scan for new pump.fun tokens using pumpfun library"""
         self.scanning = True
         self.stats['last_scan'] = datetime.datetime.now().strftime('%H:%M:%S')
 
         all_pairs = []
         scan_sources = []
+        pumpfun_coins = []
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PRIMARY: Use pumpfun library for pump.fun tokens
+        # ═══════════════════════════════════════════════════════════════════
+        if self.pumpfun_available:
+            print(Fore.CYAN + f"[{self.stats['last_scan']}] Scanning via pumpfun library...")
+
+            # 1. Get latest coins from pump.fun
+            try:
+                coins = pumpfun.get_latest_coins()
+                if coins and isinstance(coins, list):
+                    pumpfun_coins.extend(coins)
+                    scan_sources.append(f"PumpFun-Latest:{len(coins)}")
+                    print(Fore.GREEN + f"   ✓ Got {len(coins)} latest coins")
+            except Exception as e:
+                print(Fore.YELLOW + f"   get_latest_coins: {e}")
+
+            # 2. Get coins sorted by creation time (new tokens)
+            try:
+                coins = pumpfun.get_coins(
+                    limit=50,
+                    offset=0,
+                    sort='created_timestamp',
+                    search_term='',
+                    order='desc',
+                    include_nsfw=False,
+                    creator='',
+                    complete=False,
+                    meta=''
+                )
+                if coins and isinstance(coins, list):
+                    pumpfun_coins.extend(coins)
+                    scan_sources.append(f"PumpFun-New:{len(coins)}")
+                    print(Fore.GREEN + f"   ✓ Got {len(coins)} new coins")
+                elif coins and isinstance(coins, dict):
+                    items = coins.get('coins', coins.get('data', []))
+                    if items:
+                        pumpfun_coins.extend(items)
+                        scan_sources.append(f"PumpFun-New:{len(items)}")
+                        print(Fore.GREEN + f"   ✓ Got {len(items)} new coins")
+            except Exception as e:
+                print(Fore.YELLOW + f"   get_coins: {e}")
+
+            # 3. Get top runners (trending tokens)
+            try:
+                coins = pumpfun.get_top_runners()
+                if coins and isinstance(coins, list):
+                    pumpfun_coins.extend(coins)
+                    scan_sources.append(f"PumpFun-Top:{len(coins)}")
+                    print(Fore.GREEN + f"   ✓ Got {len(coins)} top runners")
+                elif coins and isinstance(coins, dict):
+                    items = coins.get('coins', coins.get('data', []))
+                    if items:
+                        pumpfun_coins.extend(items)
+                        scan_sources.append(f"PumpFun-Top:{len(items)}")
+                        print(Fore.GREEN + f"   ✓ Got {len(items)} top runners")
+            except Exception as e:
+                print(Fore.YELLOW + f"   get_top_runners: {e}")
+
+            # 4. Get king of the hill
+            try:
+                coin = pumpfun.get_king_of_the_hill()
+                if coin and isinstance(coin, dict) and coin.get('mint'):
+                    pumpfun_coins.append(coin)
+                    print(Fore.GREEN + f"   ✓ Got king of the hill")
+            except Exception as e:
+                print(Fore.YELLOW + f"   get_king_of_the_hill: {e}")
+
+            # 5. Get currently live coins
+            try:
+                coins = pumpfun.get_currently_live(limit=30, offset=0, include_nsfw=False)
+                if coins and isinstance(coins, list):
+                    pumpfun_coins.extend(coins)
+                    scan_sources.append(f"PumpFun-Live:{len(coins)}")
+                    print(Fore.GREEN + f"   ✓ Got {len(coins)} live coins")
+                elif coins and isinstance(coins, dict):
+                    items = coins.get('coins', coins.get('data', []))
+                    if items:
+                        pumpfun_coins.extend(items)
+                        scan_sources.append(f"PumpFun-Live:{len(items)}")
+                        print(Fore.GREEN + f"   ✓ Got {len(items)} live coins")
+            except Exception as e:
+                print(Fore.YELLOW + f"   get_currently_live: {e}")
+
+            # Process pumpfun coins directly
+            for coin in pumpfun_coins[:PUMPFUN_COINS_LIMIT * 2]:
+                self.process_pumpfun_coin(coin)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # FALLBACK: If pumpfun library not available, use raw API
+        # ═══════════════════════════════════════════════════════════════════
+        else:
+            print(Fore.YELLOW + f"[{self.stats['last_scan']}] pumpfun library not available, using raw API...")
+
+            # Raw API calls as fallback
+            try:
+                r = requests.get(
+                    "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=desc",
+                    timeout=8
+                )
+                if r.status_code == 200:
+                    coins = r.json()
+                    scan_sources.append(f"PumpFun-API:{len(coins)}")
+                    for coin in coins[:PUMPFUN_COINS_LIMIT]:
+                        self.process_pumpfun_coin(coin)
+            except Exception as e:
+                print(Fore.RED + f"   PumpFun API error: {e}")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # ADDITIONAL: DEXScreener sources for broader coverage
+        # ═══════════════════════════════════════════════════════════════════
 
         # 1. TOKEN PROFILES
         try:
@@ -1563,50 +1722,7 @@ class PumpSniper:
                 pass
         scan_sources.append(f"Search:{len(hot_terms)}terms")
 
-        # 4. PUMP.FUN - Enhanced scanning for fresh launches
-        # Scan Pump.fun NEW coins
-        try:
-            r = requests.get(
-                "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=desc",
-                timeout=8
-            )
-            if r.status_code == 200:
-                coins = r.json()
-                scan_sources.append(f"PumpFun-New:{len(coins)}")
-                for coin in coins[:PUMPFUN_COINS_LIMIT]:  # Check more coins
-                    mint = coin.get('mint', '')
-                    if mint:
-                        # Get market cap from pump.fun data if available
-                        mcap = float(coin.get('usd_market_cap', 0) or 0)
-                        # Fetch if no mcap data OR if mcap is in valid range
-                        if mcap == 0 or mcap < MAX_MARKET_CAP:
-                            p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
-                            all_pairs.extend(p[:2])
-                        time.sleep(0.1)
-        except:
-            pass
-
-        # Scan Pump.fun GRADUATING/ACTIVE coins (about to hit Raydium - high potential!)
-        try:
-            r = requests.get(
-                "https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=last_trade_timestamp&order=desc",
-                timeout=8
-            )
-            if r.status_code == 200:
-                coins = r.json()
-                scan_sources.append(f"PumpFun-Active:{len(coins)}")
-                for coin in coins[:PUMPFUN_COINS_LIMIT]:
-                    mint = coin.get('mint', '')
-                    mcap = float(coin.get('usd_market_cap', 0) or 0)
-                    # Look for coins with good market cap that are actively trading
-                    if mint and (mcap == 0 or (mcap > MIN_MARKET_CAP and mcap < MAX_MARKET_CAP)):
-                        p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
-                        all_pairs.extend(p[:2])
-                        time.sleep(0.1)
-        except:
-            pass
-
-        # 5. CHAIN SEARCHES
+        # 4. CHAIN SEARCHES
         for chain in ['solana', 'base', 'bsc']:
             try:
                 pairs = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/search?q=chain:{chain}")
@@ -1615,8 +1731,7 @@ class PumpSniper:
             except:
                 pass
 
-        # ANALYZE
-        self.hot_tokens = {}
+        # ANALYZE DEXScreener pairs
         seen = set()
         new_tokens = 0
         vol_spikes = 0
@@ -1681,17 +1796,182 @@ class PumpSniper:
         self.stats['volume_spikes_found'] = vol_spikes
         self.stats['whale_buys_found'] = whale_buys
 
-        sources_str = ' | '.join(scan_sources)
-        print(Fore.CYAN + f"[{self.stats['last_scan']}] Scanned {parsed} pairs from {sources_str}")
+        # Add pumpfun tokens count
+        pumpfun_signals = len(self.hot_tokens) - signals
+        self.stats['pumpfun_tokens'] = self.stats.get('pumpfun_tokens', 0) + len(pumpfun_coins)
 
-        if signals > 0:
+        sources_str = ' | '.join(scan_sources)
+        total_tokens = parsed + len(pumpfun_coins)
+        print(Fore.CYAN + f"[{self.stats['last_scan']}] Scanned {total_tokens} tokens from {sources_str}")
+
+        total_signals = len(self.hot_tokens)
+        if total_signals > 0:
             top = sorted(self.hot_tokens.values(), key=lambda x: x.insider_score, reverse=True)[:5]
-            print(Fore.RED + f"🚨 {signals} SIGNALS: ", end="")
+            print(Fore.RED + f"🚨 {total_signals} SIGNALS: ", end="")
             for t in top:
                 print(f"{t.symbol}({t.insider_score:.0f}) ", end="")
             print()
         else:
             print(Fore.YELLOW + f"No signals meeting threshold (min score: {MIN_INSIDER_SCORE})")
+
+        self.scanning = False
+
+    def process_pumpfun_coin(self, coin_data):
+        """Process token data from pumpfun library"""
+        try:
+            # Handle both dict and object responses
+            if hasattr(coin_data, '__dict__'):
+                coin = vars(coin_data)
+            elif isinstance(coin_data, dict):
+                coin = coin_data
+            else:
+                coin = {'mint': str(coin_data)}
+
+            # Get mint address
+            mint = coin.get('mint') or coin.get('address') or coin.get('token_address') or ''
+            if not mint:
+                return
+
+            symbol = str(coin.get('symbol', '???'))[:12]
+            name = str(coin.get('name', 'Unknown'))[:30]
+
+            # Market cap - try different field names
+            mcap = float(
+                coin.get('market_cap', 0) or
+                coin.get('usd_market_cap', 0) or
+                coin.get('marketCap', 0) or
+                coin.get('mcap', 0) or 0
+            )
+
+            # Created timestamp
+            created = (
+                coin.get('created_timestamp') or
+                coin.get('created_at') or
+                coin.get('createdAt') or
+                coin.get('timestamp') or 0
+            )
+
+            # Reply count
+            replies = int(
+                coin.get('reply_count', 0) or
+                coin.get('replies', 0) or
+                coin.get('comment_count', 0) or 0
+            )
+
+            is_graduating = coin.get('is_graduating', False)
+
+            # Calculate age in minutes
+            if created:
+                if created > 1e12:  # milliseconds
+                    age_mins = (time.time() * 1000 - created) / (1000 * 60)
+                else:  # seconds
+                    age_mins = (time.time() - created) / 60
+            else:
+                age_mins = 999
+
+            unique_id = f"solana_{mint}"
+
+            # Skip if already tracking
+            if unique_id in self.hot_tokens:
+                return
+            if self.is_token_dead(unique_id):
+                return
+            if self.is_holding(unique_id):
+                return
+            if self.is_on_cooldown(unique_id):
+                return
+
+            # Score the token
+            score = 0
+            reasons = []
+
+            # Age scoring (fresher = better)
+            if age_mins < 2:
+                score += 70
+                reasons.append(f"🆕 {age_mins:.1f}m SUPER FRESH!")
+            elif age_mins < 5:
+                score += 55
+                reasons.append(f"🆕 {age_mins:.0f}m fresh!")
+            elif age_mins < 10:
+                score += 40
+                reasons.append(f"🆕 {age_mins:.0f}m old")
+            elif age_mins < 30:
+                score += 25
+                reasons.append(f"⏰ {age_mins:.0f}m")
+            elif age_mins < 60:
+                score += 10
+
+            # Market cap scoring
+            if 5000 <= mcap <= 25000:
+                score += 50
+                reasons.append(f"💎 ${mcap/1000:.0f}k perfect!")
+            elif 25000 < mcap <= 50000:
+                score += 40
+                reasons.append(f"💰 ${mcap/1000:.0f}k great")
+            elif 50000 < mcap <= 80000:
+                score += 30
+                reasons.append(f"📊 ${mcap/1000:.0f}k good")
+            elif mcap > 80000:
+                score += 15
+                reasons.append(f"📊 ${mcap/1000:.0f}k")
+            elif mcap > 0:
+                score += 5
+
+            # Graduating bonus (about to hit Raydium = huge pump potential)
+            if is_graduating:
+                score += 60
+                reasons.append(f"🎓 GRADUATING!")
+
+            # Reply count scoring
+            if replies >= 100:
+                score += 40
+                reasons.append(f"🔥 {replies} replies!")
+            elif replies >= 50:
+                score += 25
+                reasons.append(f"💬 {replies} replies")
+            elif replies >= 20:
+                score += 15
+                reasons.append(f"💬 {replies}")
+
+            # Minimum score threshold
+            if score < 40:
+                return
+
+            # Create token object
+            token = Token(
+                symbol=symbol,
+                name=name,
+                chain='solana',
+                contract=mint,
+                pair_address=mint,
+                price=mcap / 1000000000 if mcap > 0 else 0.000001,
+                market_cap=mcap,
+                liquidity=mcap * 0.1,  # Estimate
+                volume_5m=0,
+                volume_1h=0,
+                volume_24h=0,
+                change_5m=0,
+                change_1h=0,
+                change_24h=0,
+                buys_5m=replies,
+                sells_5m=0,
+                buys_1h=replies,
+                sells_1h=0,
+                age_minutes=age_mins,
+                dex_url=f"https://pump.fun/{mint}",  # Always pump.fun link
+                dex_id='pumpfun',
+                insider_score=score,
+                alert_reasons=reasons,
+                buy_pressure=0.7
+            )
+
+            self.hot_tokens[unique_id] = token
+            self.stats['pumpfun_tokens'] = self.stats.get('pumpfun_tokens', 0) + 1
+
+            print(Fore.GREEN + f"   ✓ {symbol} - Score: {score} - {reasons[0] if reasons else ''}")
+
+        except Exception as e:
+            print(Fore.RED + f"   Error processing coin: {e}")
 
         self.scanning = False
 
