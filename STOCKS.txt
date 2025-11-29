@@ -75,6 +75,11 @@ MAX_MCAP_LIQ_RATIO = 50  # Market cap shouldn't be more than 50x liquidity
 
 # Pump.fun Scanning
 PUMPFUN_COINS_LIMIT = 30  # Number of pump.fun coins to process
+MIN_PUMPFUN_SCORE = 40  # Minimum score threshold for pumpfun tokens
+PUMPFUN_PROCESSING_MULTIPLIER = 2  # Process extra coins from pumpfun library
+LIQUIDITY_ESTIMATION_FACTOR = 0.1  # Estimate liquidity as 10% of market cap
+DEFAULT_PUMPFUN_BUY_PRESSURE = 0.7  # Default buy pressure for pumpfun tokens
+DEFAULT_MIN_PRICE = 0.000001  # Minimum price fallback
 
 # EXIT STRATEGY
 TAKE_PROFIT_PERCENT = 500  # Let moonshots ride!
@@ -1654,7 +1659,7 @@ class PumpSniper:
                 print(Fore.YELLOW + f"   get_currently_live: {e}")
 
             # Process pumpfun coins directly
-            for coin in pumpfun_coins[:PUMPFUN_COINS_LIMIT * 2]:
+            for coin in pumpfun_coins[:PUMPFUN_COINS_LIMIT * PUMPFUN_PROCESSING_MULTIPLIER]:
                 self.process_pumpfun_coin(coin)
 
         # ═══════════════════════════════════════════════════════════════════
@@ -1934,7 +1939,7 @@ class PumpSniper:
                 reasons.append(f"💬 {replies}")
 
             # Minimum score threshold
-            if score < 40:
+            if score < MIN_PUMPFUN_SCORE:
                 return
 
             # Create token object
@@ -1944,9 +1949,9 @@ class PumpSniper:
                 chain='solana',
                 contract=mint,
                 pair_address=mint,
-                price=mcap / 1000000000 if mcap > 0 else 0.000001,
+                price=mcap / 1_000_000_000 if mcap > 0 else DEFAULT_MIN_PRICE,
                 market_cap=mcap,
-                liquidity=mcap * 0.1,  # Estimate
+                liquidity=mcap * LIQUIDITY_ESTIMATION_FACTOR,  # Estimate
                 volume_5m=0,
                 volume_1h=0,
                 volume_24h=0,
@@ -1962,7 +1967,7 @@ class PumpSniper:
                 dex_id='pumpfun',
                 insider_score=score,
                 alert_reasons=reasons,
-                buy_pressure=0.7
+                buy_pressure=DEFAULT_PUMPFUN_BUY_PRESSURE
             )
 
             self.hot_tokens[unique_id] = token
@@ -1972,8 +1977,6 @@ class PumpSniper:
 
         except Exception as e:
             print(Fore.RED + f"   Error processing coin: {e}")
-
-        self.scanning = False
 
     def update_positions(self):
         if not self.positions:
