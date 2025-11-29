@@ -66,6 +66,10 @@ MIN_SIGNALS_REQUIRED = 2
 MAX_CHANGE_5M = 150
 LOW_BUY_PRESSURE_PENALTY_THRESHOLD = 0.45  # Penalize if buy pressure below this
 
+# PumpPortal Token Processing
+PUMPFUN_MIN_SCORE = 40  # Lowered threshold for pump.fun tokens (fresh coins have less data)
+PUMPFUN_LIQUIDITY_RATIO = 0.1  # Estimate liquidity as 10% of market cap for pump.fun tokens
+
 # Market Cap Filters
 MIN_MARKET_CAP = 5000  # $5k minimum
 MAX_MARKET_CAP = 500000  # $500k maximum - above this already pumped
@@ -1330,10 +1334,11 @@ class PumpSniper:
                 if token_data:
                     mcap = float(token_data.get('market_cap', 0) or token_data.get('usd_market_cap', 0) or 0)
                     # Convert to DexScreener-like format for compatibility
+                    # Price estimated assuming 1B token supply (typical for pump.fun)
                     pair = {
                         'priceUsd': mcap / 1000000000 if mcap > 0 else 0,
                         'fdv': mcap,
-                        'liquidity': {'usd': mcap * 0.1},  # Estimate
+                        'liquidity': {'usd': mcap * PUMPFUN_LIQUIDITY_RATIO},
                         'txns': {'m5': {'buys': 0, 'sells': 0}},
                         'volume': {'m5': 0, 'h1': 0}
                     }
@@ -1341,8 +1346,9 @@ class PumpSniper:
                         return 'dead', pair
                     return 'active', pair
                 return 'dead', None
-            except Exception:
-                pass  # Fall through to DexScreener
+            except Exception as e:
+                # Fall through to DexScreener on any PumpPortal error
+                print(Fore.YELLOW + f"   PumpPortal lookup failed, using DexScreener: {e}")
         
         # Fallback to DexScreener for other chains or if PumpPortal fails
         try:
@@ -1653,11 +1659,12 @@ class PumpSniper:
                 score += 15
                 reasons.append(f"💬 {replies}")
             
-            # Minimum score threshold (lowered for pump.fun)
-            if score < 40:
+            # Minimum score threshold (lowered for pump.fun - fresh coins have less data)
+            if score < PUMPFUN_MIN_SCORE:
                 return
             
             # Create token object
+            # Price is estimated from market cap assuming 1B token supply (typical for pump.fun)
             token = Token(
                 symbol=symbol,
                 name=name,
@@ -1666,7 +1673,7 @@ class PumpSniper:
                 pair_address=mint,
                 price=mcap / 1000000000 if mcap > 0 else 0.000001,
                 market_cap=mcap,
-                liquidity=mcap * 0.1,  # Estimate
+                liquidity=mcap * PUMPFUN_LIQUIDITY_RATIO,
                 volume_5m=0,
                 volume_1h=0,
                 volume_24h=0,
