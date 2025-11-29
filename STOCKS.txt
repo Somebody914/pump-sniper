@@ -146,12 +146,15 @@ PUMPFUN_PUBLIC_API = "https://pump.fun/api/coins"
 
 # HTTP Headers for API requests (prevents blocking)
 API_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     'Accept': 'application/json',
     'Accept-Language': 'en-US,en;q=0.9',
     'Origin': 'https://pump.fun',
     'Referer': 'https://pump.fun/'
 }
+
+# Default values for pump.fun coin processing
+PUMPFUN_DEFAULT_BUY_PRESSURE = 0.7  # Assumed buy pressure when no transaction data available
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 SLIPPAGE_BPS = 250  # 2.5% slippage for buys (was 10% - way too high!)
@@ -1601,6 +1604,24 @@ class PumpSniper:
             created = coin.get('created_timestamp', 0)
             replies = int(coin.get('reply_count', 0) or 0)
 
+            # Get virtual token reserves and SOL reserves for price calculation
+            # Pump.fun provides these fields for accurate price calculation
+            virtual_token_reserves = float(coin.get('virtual_token_reserves', 0) or 0)
+            virtual_sol_reserves = float(coin.get('virtual_sol_reserves', 0) or 0)
+
+            # Calculate price from reserves if available, otherwise estimate from market cap
+            if virtual_token_reserves > 0 and virtual_sol_reserves > 0:
+                # Price in SOL = SOL reserves / token reserves
+                # Assuming SOL price of ~$150 for USD conversion
+                sol_price_estimate = 150.0
+                token_price = (virtual_sol_reserves / virtual_token_reserves) * sol_price_estimate / 1e9
+            elif mcap > 0:
+                # If no reserve data, get price from total supply if available
+                total_supply = float(coin.get('total_supply', 1000000000) or 1000000000)
+                token_price = mcap / total_supply if total_supply > 0 else 0.000001
+            else:
+                token_price = 0.000001  # Fallback minimum
+
             # Calculate age
             if created:
                 age_mins = (time.time() * 1000 - created) / (1000 * 60)
@@ -1663,14 +1684,14 @@ class PumpSniper:
                 chain='solana',
                 contract=mint,
                 pair_address=mint,
-                price=mcap / 1000000000 if mcap > 0 else 0.000001,
+                price=token_price,
                 market_cap=mcap,
                 liquidity=est_liquidity,
                 age_minutes=age_mins,
                 dex_url=f"https://pump.fun/{mint}",
                 insider_score=score,
                 alert_reasons=reasons,
-                buy_pressure=0.7
+                buy_pressure=PUMPFUN_DEFAULT_BUY_PRESSURE
             )
 
             return token
@@ -1683,6 +1704,9 @@ class PumpSniper:
         """Scan for new pump.fun tokens - FIXED with working APIs and proper headers"""
         self.scanning = True
         self.stats['last_scan'] = datetime.datetime.now().strftime('%H:%M:%S')
+
+        # Clear stale hot tokens at start of each scan
+        self.hot_tokens = {}
 
         all_pairs = []
         scan_sources = []
