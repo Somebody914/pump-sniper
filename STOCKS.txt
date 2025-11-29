@@ -51,14 +51,14 @@ MAX_CHANGE_5M = 150
 LOW_BUY_PRESSURE_PENALTY_THRESHOLD = 0.45  # Penalize if buy pressure below this
 
 # Market Cap Filters
-MIN_MARKET_CAP = 5000  # $5k minimum
-MAX_MARKET_CAP = 500000  # $500k maximum - above this already pumped
+MIN_MARKET_CAP = 3000  # $3k minimum
+MAX_MARKET_CAP = 300000  # $300k maximum - above this already pumped
 IDEAL_MCAP_LOW = 10000  # $10k
 IDEAL_MCAP_HIGH = 50000  # $50k - sweet spot for pumps
 MAX_MCAP_LIQ_RATIO = 50  # Market cap shouldn't be more than 50x liquidity
 
 # Pump.fun Scanning
-PUMPFUN_COINS_LIMIT = 30  # Number of pump.fun coins to process
+PUMPFUN_COINS_LIMIT = 50  # Number of pump.fun coins to process
 
 # EXIT STRATEGY
 TAKE_PROFIT_PERCENT = 500  # Let moonshots ride!
@@ -133,6 +133,13 @@ else:
 JUPITER_QUOTE_API = "https://lite-api.jup.ag/swap/v1/quote"
 JUPITER_SWAP_API = "https://lite-api.jup.ag/swap/v1/swap"
 PUMPPORTAL_API = "https://pumpportal.fun/api/trade-local"
+
+# PumpPortal/Pump.fun APIs (replaces DexScreener for faster detection)
+PUMPPORTAL_TRADES_API = "https://pumpportal.fun/api/trades/latest"
+PUMPPORTAL_TOKEN_API = "https://pumpportal.fun/api/token/"
+PUMPFUN_NEW_API = "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=desc"
+PUMPFUN_ACTIVE_API = "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=last_trade_timestamp&order=desc"
+PUMPFUN_TOP_API = "https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=usd_market_cap&order=desc"
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 SLIPPAGE_BPS = 250  # 2.5% slippage for buys (was 10% - way too high!)
@@ -282,12 +289,13 @@ class SolanaTrader:
     async def get_sol_price(self) -> float:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(f"https://api.dexscreener.com/latest/dex/tokens/{SOL_MINT}")
+                # Use PumpPortal to get SOL price via a known token pair
+                resp = await client.get(f"{PUMPPORTAL_TOKEN_API}So11111111111111111111111111111111111111112")
                 if resp.status_code == 200:
                     data = resp.json()
-                    pairs = data.get("pairs", [])
-                    if pairs:
-                        return float(pairs[0].get("priceUsd", 0))
+                    price = float(data.get("priceUsd", 0) or data.get("price_usd", 0) or 0)
+                    if price > 0:
+                        return price
         except:
             pass
         return 150.0
@@ -809,9 +817,7 @@ class Token:
     alert_reasons: list = field(default_factory=list)
 
     def get_chart_url(self) -> str:
-        if self.dex_url:
-            return self.dex_url
-        return f"https://dexscreener.com/{self.chain}/{self.pair_address}"
+        return f"https://pump.fun/{self.contract}"
 
     def get_unique_id(self) -> str:
         return f"{self.chain}_{self.pair_address}"
@@ -849,7 +855,7 @@ class Position:
     tx_hash: str = ''  # NEW: Store transaction hash for reference
 
     def get_chart_url(self) -> str:
-        return self.dex_url or f"https://dexscreener.com/{self.chain}/{self.pair_address}"
+        return f"https://pump.fun/{self.contract}"
 
     def get_hold_time_minutes(self) -> float:
         return (time.time() - self.entry_time) / 60
@@ -1098,13 +1104,11 @@ class PumpSniper:
                     # Get SOL price (sync version to avoid asyncio issues in init)
                     try:
                         import requests
-                        r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{SOL_MINT}", timeout=10)
+                        r = requests.get(f"{PUMPPORTAL_TOKEN_API}So11111111111111111111111111111111111111112", timeout=10)
                         if r.status_code == 200:
                             data = r.json()
-                            pairs = data.get("pairs", [])
-                            if pairs:
-                                sol_price = float(pairs[0].get("priceUsd", 150))
-                            else:
+                            sol_price = float(data.get("priceUsd", 0) or data.get("price_usd", 0) or 150)
+                            if sol_price <= 0:
                                 sol_price = 150.0
                         else:
                             sol_price = 150.0
@@ -1295,10 +1299,12 @@ class PumpSniper:
             print(Fore.RED + f"☠️ Marked dead: {pair_id[:20]}... - {reason}")
 
     def check_pair_status(self, chain: str, pair_address: str) -> tuple[str, dict | None]:
+        """Check token status using PumpPortal API instead of DexScreener"""
         try:
             self.stats['api_calls'] += 1
+            # Use PumpPortal to check token status
             r = requests.get(
-                f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_address}",
+                f"{PUMPPORTAL_TOKEN_API}{pair_address}",
                 timeout=8
             )
             if r.status_code == 404:
@@ -1308,16 +1314,23 @@ class PumpSniper:
                 return 'error', None
             if r.status_code == 200:
                 data = r.json()
-                pair = data.get('pair')
-                if not pair and isinstance(data.get('pairs'), list) and len(data['pairs']) > 0:
-                    pair = data['pairs'][0]
-                if not pair:
+                if not data:
                     return 'dead', None
-                price = float(pair.get('priceUsd', 0) or 0)
-                liq = pair.get('liquidity', {})
-                liq_usd = float(liq.get('usd', 0) or 0) if isinstance(liq, dict) else 0
+                # Convert PumpPortal data format to expected format
+                price = float(data.get('priceUsd', 0) or data.get('price_usd', 0) or 0)
+                liq_usd = float(data.get('liquidity', 0) or data.get('usd_market_cap', 0) or 0)
                 if price <= 0 and liq_usd < MIN_ALIVE_LIQUIDITY:
-                    return 'dead', pair
+                    return 'dead', data
+                # Create pair-compatible dict from PumpPortal response
+                pair = {
+                    'priceUsd': price,
+                    'liquidity': {'usd': liq_usd},
+                    'fdv': data.get('usd_market_cap', 0),
+                    'txns': {
+                        'm5': {'buys': 0, 'sells': 0},
+                        'h1': {'buys': 0, 'sells': 0}
+                    }
+                }
                 return 'active', pair
             self.stats['api_errors'] += 1
             return 'error', None
@@ -1485,8 +1498,8 @@ class PumpSniper:
                 buys_1h=int(txns_1h.get('buys', 0) or 0),
                 sells_1h=int(txns_1h.get('sells', 0) or 0),
                 age_minutes=age_min,
-                dex_url=pair.get('url', f"https://dexscreener.com/{chain}/{pair_addr}"),
-                dex_id=pair.get('dexId', '').lower(),
+                dex_url=f"https://pump.fun/{base.get('address', '')}",
+                dex_id='pumpfun',
                 first_seen_price=price
             )
 
@@ -1515,105 +1528,310 @@ class PumpSniper:
             score += 10
         return score
 
+    def parse_pumpfun_token(self, coin: dict) -> Token | None:
+        """Parse token data from Pump.fun API response"""
+        try:
+            if not coin or not isinstance(coin, dict):
+                return None
+
+            mint = coin.get('mint', '')
+            if not mint:
+                return None
+
+            # Calculate age from created_timestamp (handle both ms and seconds)
+            created_ts = coin.get('created_timestamp', 0)
+            age_min = 9999
+            if created_ts:
+                try:
+                    # Pump.fun API returns timestamp in milliseconds
+                    if created_ts > 1e12:  # Timestamp is in milliseconds
+                        age_min = (time.time() * 1000 - created_ts) / (1000 * 60)
+                    else:  # Timestamp is in seconds
+                        age_min = (time.time() - created_ts) / 60
+                except:
+                    pass
+
+            # Get market cap and check filters
+            mcap = float(coin.get('usd_market_cap', 0) or 0)
+            if mcap > MAX_MARKET_CAP:
+                return None
+
+            # Get reply count for social scoring
+            reply_count = int(coin.get('reply_count', 0) or 0)
+
+            # Build Token object from pump.fun data
+            # Note: Pump.fun tokens typically have ~10% of market cap as liquidity
+            estimated_liquidity = mcap * 0.1 if mcap > 0 else 0
+            token = Token(
+                symbol=str(coin.get('symbol', '?'))[:12],
+                name=str(coin.get('name', ''))[:30],
+                chain='solana',
+                contract=mint,
+                pair_address=mint,  # Use mint as pair address for pump.fun
+                price=0,  # Will be fetched from PumpPortal
+                market_cap=mcap,
+                liquidity=estimated_liquidity,
+                volume_5m=0,
+                volume_1h=0,
+                volume_24h=0,
+                change_5m=0,
+                change_1h=0,
+                change_24h=0,
+                buys_5m=0,
+                sells_5m=0,
+                buys_1h=0,
+                sells_1h=0,
+                age_minutes=age_min,
+                dex_url=f"https://pump.fun/{mint}",
+                dex_id='pumpfun',
+                first_seen_price=0
+            )
+
+            # Fetch detailed data from PumpPortal
+            try:
+                r = requests.get(f"{PUMPPORTAL_TOKEN_API}{mint}", timeout=5)
+                if r.status_code == 200:
+                    data = r.json()
+                    price = float(data.get('priceUsd', 0) or data.get('price_usd', 0) or 0)
+                    if price > 0:
+                        token.price = price
+                        token.first_seen_price = price
+                    liq = float(data.get('liquidity', 0) or 0)
+                    if liq > 0:
+                        token.liquidity = liq
+            except:
+                pass
+
+            # Skip if no valid price or liquidity too low
+            if token.price <= 0:
+                # Try to estimate price from market cap
+                # Pump.fun tokens typically have ~1 billion total supply
+                # This is a rough estimate when PumpPortal doesn't return price
+                if mcap > 0:
+                    token.price = mcap / 1e9
+                else:
+                    return None
+
+            if token.liquidity < MIN_LIQUIDITY and mcap < MIN_MARKET_CAP:
+                return None
+
+            # Apply Pump.fun specific scoring
+            signals = self.analyze_pumpfun_token(token, reply_count, mcap)
+            token.insider_score = signals['score']
+            token.alert_reasons = signals['reasons']
+            token.is_new_token = signals['is_new']
+            token.is_volume_spike = signals.get('volume_spike', False)
+            token.is_whale_accumulating = signals.get('whale_buy', False)
+            token.is_coordinated_buy = signals.get('coordinated', False)
+            token.pump_score = self.calculate_pump_score(token)
+
+            return token
+        except Exception as e:
+            return None
+
+    def fetch_pumpportal_token(self, mint: str) -> Token | None:
+        """Fetch and parse token data from PumpPortal API"""
+        try:
+            self.stats['api_calls'] += 1
+            r = requests.get(f"{PUMPPORTAL_TOKEN_API}{mint}", timeout=8)
+            if r.status_code != 200:
+                return None
+
+            data = r.json()
+            if not data:
+                return None
+
+            price = float(data.get('priceUsd', 0) or data.get('price_usd', 0) or 0)
+            mcap = float(data.get('usd_market_cap', 0) or data.get('market_cap', 0) or 0)
+            liq = float(data.get('liquidity', 0) or 0)
+
+            if price <= 0:
+                return None
+
+            if mcap > MAX_MARKET_CAP:
+                return None
+
+            token = Token(
+                symbol=str(data.get('symbol', '?'))[:12],
+                name=str(data.get('name', ''))[:30],
+                chain='solana',
+                contract=mint,
+                pair_address=mint,
+                price=price,
+                market_cap=mcap,
+                liquidity=liq if liq > 0 else mcap * 0.1,
+                volume_5m=0,
+                volume_1h=0,
+                volume_24h=0,
+                change_5m=0,
+                change_1h=0,
+                change_24h=0,
+                buys_5m=0,
+                sells_5m=0,
+                buys_1h=0,
+                sells_1h=0,
+                age_minutes=0,
+                dex_url=f"https://pump.fun/{mint}",
+                dex_id='pumpfun',
+                first_seen_price=price
+            )
+
+            # Calculate age if available
+            created = data.get('created_timestamp', 0)
+            if created:
+                try:
+                    # Handle both milliseconds and seconds timestamps
+                    if created > 1e12:  # Timestamp is in milliseconds
+                        token.age_minutes = (time.time() * 1000 - created) / (1000 * 60)
+                    else:  # Timestamp is in seconds
+                        token.age_minutes = (time.time() - created) / 60
+                except:
+                    pass
+
+            # Apply Pump.fun scoring
+            reply_count = int(data.get('reply_count', 0) or 0)
+            signals = self.analyze_pumpfun_token(token, reply_count, mcap)
+            token.insider_score = signals['score']
+            token.alert_reasons = signals['reasons']
+            token.is_new_token = signals['is_new']
+            token.pump_score = self.calculate_pump_score(token)
+
+            return token
+        except:
+            return None
+
+    def analyze_pumpfun_token(self, token: Token, reply_count: int, mcap: float) -> dict:
+        """Pump.fun specific scoring based on the problem requirements"""
+        signals = {
+            'is_new': False,
+            'volume_spike': False,
+            'whale_buy': False,
+            'coordinated': False,
+            'reasons': [],
+            'score': 0
+        }
+
+        # AGE SCORING (Pump.fun specific - prioritize ultra-fresh)
+        if token.age_minutes < 2:
+            signals['is_new'] = True
+            signals['score'] += 70
+            signals['reasons'].append(f"🔥 {token.age_minutes:.0f}m FRESH!")
+        elif token.age_minutes < 5:
+            signals['is_new'] = True
+            signals['score'] += 55
+            signals['reasons'].append(f"🆕 {token.age_minutes:.0f}m new")
+        elif token.age_minutes < 10:
+            signals['is_new'] = True
+            signals['score'] += 40
+            signals['reasons'].append(f"⏰ {token.age_minutes:.0f}m old")
+        elif token.age_minutes < 30:
+            signals['is_new'] = True
+            signals['score'] += 20
+            signals['reasons'].append(f"⏰ {token.age_minutes:.0f}m")
+
+        # MARKET CAP SCORING (Pump.fun specific ranges)
+        # Note: Check specific ranges first, then fall through to broader ranges
+        if mcap > 0:
+            if 3000 <= mcap < 10000:
+                signals['score'] += 35
+                signals['reasons'].append(f"💎 Early ${mcap/1000:.0f}k")
+            elif 10000 <= mcap < 25000:
+                signals['score'] += 45
+                signals['reasons'].append(f"🎯 Sweet ${mcap/1000:.0f}k")
+            elif 25000 <= mcap < 50000:
+                signals['score'] += 35
+                signals['reasons'].append(f"✨ Good ${mcap/1000:.0f}k")
+            elif 60000 <= mcap <= 90000:
+                # GRADUATING - about to hit Raydium! (takes priority over 50-100k range)
+                signals['score'] += 60
+                signals['reasons'].append(f"🚀 GRADUATING ${mcap/1000:.0f}k!")
+            elif 50000 <= mcap < 60000:
+                # Just under graduating threshold
+                signals['score'] += 30
+                signals['reasons'].append(f"📊 ${mcap/1000:.0f}k mcap")
+            elif 90000 < mcap < 100000:
+                # Just past graduation, still okay
+                signals['score'] += 25
+                signals['reasons'].append(f"📊 ${mcap/1000:.0f}k mcap")
+
+        # REPLY COUNT SCORING (social engagement)
+        if reply_count >= 100:
+            signals['score'] += 40
+            signals['reasons'].append(f"💬 {reply_count} replies!")
+        elif reply_count >= 50:
+            signals['score'] += 25
+            signals['reasons'].append(f"💬 {reply_count} replies")
+        elif reply_count >= 20:
+            signals['score'] += 15
+            signals['reasons'].append(f"💬 {reply_count} replies")
+
+        return signals
+
     def scan_for_pumps(self):
         self.scanning = True
         self.stats['last_scan'] = datetime.datetime.now().strftime('%H:%M:%S')
 
-        all_pairs = []
+        all_tokens = []
         scan_sources = []
 
-        # 1. TOKEN PROFILES
+        # 1. PUMP.FUN NEW COINS - Freshest launches
         try:
-            r = requests.get("https://api.dexscreener.com/token-boosts/top/v1", timeout=8)
-            if r.status_code == 200:
-                boosted = r.json()
-                scan_sources.append(f"Boosted:{len(boosted)}")
-                for item in boosted[:30]:
-                    addr = item.get('tokenAddress', '')
-                    if addr:
-                        p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{addr}")
-                        all_pairs.extend(p[:3])
-                        time.sleep(0.15)
-        except Exception as e:
-            print(Fore.RED + f"Boost fetch error: {e}")
-
-        # 2. LATEST TOKEN PROFILES
-        try:
-            r = requests.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=8)
-            if r.status_code == 200:
-                latest = r.json()
-                scan_sources.append(f"Latest:{len(latest)}")
-                for item in latest[:20]:
-                    addr = item.get('tokenAddress', '')
-                    if addr:
-                        p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{addr}")
-                        all_pairs.extend(p[:2])
-                        time.sleep(0.15)
-        except Exception as e:
-            print(Fore.RED + f"Latest fetch error: {e}")
-
-        # 3. SEARCH HOT TERMS
-        hot_terms = ['pump', 'moon', 'pepe', 'doge', 'shib', 'ape', 'wojak', 'chad', 'based', 'send']
-        for term in hot_terms:
-            try:
-                pairs = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/search?q={term}")
-                all_pairs.extend(pairs[:15])
-                time.sleep(0.2)
-            except:
-                pass
-        scan_sources.append(f"Search:{len(hot_terms)}terms")
-
-        # 4. PUMP.FUN - Enhanced scanning for fresh launches
-        # Scan Pump.fun NEW coins
-        try:
-            r = requests.get(
-                "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=desc",
-                timeout=8
-            )
+            r = requests.get(PUMPFUN_NEW_API, timeout=8)
             if r.status_code == 200:
                 coins = r.json()
                 scan_sources.append(f"PumpFun-New:{len(coins)}")
-                for coin in coins[:PUMPFUN_COINS_LIMIT]:  # Check more coins
-                    mint = coin.get('mint', '')
-                    if mint:
-                        # Get market cap from pump.fun data if available
-                        mcap = float(coin.get('usd_market_cap', 0) or 0)
-                        # Fetch if no mcap data OR if mcap is in valid range
-                        if mcap == 0 or mcap < MAX_MARKET_CAP:
-                            p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
-                            all_pairs.extend(p[:2])
-                        time.sleep(0.1)
-        except:
-            pass
+                for coin in coins[:PUMPFUN_COINS_LIMIT]:
+                    token = self.parse_pumpfun_token(coin)
+                    if token:
+                        all_tokens.append(token)
+        except Exception as e:
+            print(Fore.RED + f"PumpFun-New fetch error: {e}")
 
-        # Scan Pump.fun GRADUATING/ACTIVE coins (about to hit Raydium - high potential!)
+        # 2. PUMP.FUN ACTIVE COINS - Most active trading
         try:
-            r = requests.get(
-                "https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=last_trade_timestamp&order=desc",
-                timeout=8
-            )
+            r = requests.get(PUMPFUN_ACTIVE_API, timeout=8)
             if r.status_code == 200:
                 coins = r.json()
                 scan_sources.append(f"PumpFun-Active:{len(coins)}")
                 for coin in coins[:PUMPFUN_COINS_LIMIT]:
-                    mint = coin.get('mint', '')
-                    mcap = float(coin.get('usd_market_cap', 0) or 0)
-                    # Look for coins with good market cap that are actively trading
-                    if mint and (mcap == 0 or (mcap > MIN_MARKET_CAP and mcap < MAX_MARKET_CAP)):
-                        p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
-                        all_pairs.extend(p[:2])
-                        time.sleep(0.1)
-        except:
-            pass
+                    token = self.parse_pumpfun_token(coin)
+                    if token:
+                        all_tokens.append(token)
+        except Exception as e:
+            print(Fore.RED + f"PumpFun-Active fetch error: {e}")
 
-        # 5. CHAIN SEARCHES
-        for chain in ['solana', 'base', 'bsc']:
-            try:
-                pairs = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/search?q=chain:{chain}")
-                all_pairs.extend(pairs[:20])
-                time.sleep(0.2)
-            except:
-                pass
+        # 3. PUMP.FUN TOP BY MARKET CAP - Established but still early
+        try:
+            r = requests.get(PUMPFUN_TOP_API, timeout=8)
+            if r.status_code == 200:
+                coins = r.json()
+                scan_sources.append(f"PumpFun-Top:{len(coins)}")
+                for coin in coins[:30]:
+                    token = self.parse_pumpfun_token(coin)
+                    if token:
+                        all_tokens.append(token)
+        except Exception as e:
+            print(Fore.RED + f"PumpFun-Top fetch error: {e}")
+
+        # 4. PUMPPORTAL LATEST TRADES - Real-time trade detection
+        try:
+            r = requests.get(PUMPPORTAL_TRADES_API, timeout=8)
+            if r.status_code == 200:
+                trades = r.json()
+                scan_sources.append(f"PumpPortal-Trades:{len(trades) if isinstance(trades, list) else 0}")
+                seen_mints = set()
+                if isinstance(trades, list):
+                    for trade in trades[:50]:
+                        mint = trade.get('mint', '')
+                        if mint and mint not in seen_mints:
+                            seen_mints.add(mint)
+                            # Fetch full token data from PumpPortal
+                            token = self.fetch_pumpportal_token(mint)
+                            if token:
+                                all_tokens.append(token)
+                            time.sleep(0.05)
+        except Exception as e:
+            print(Fore.RED + f"PumpPortal-Trades fetch error: {e}")
 
         # ANALYZE
         self.hot_tokens = {}
@@ -1624,20 +1842,15 @@ class PumpSniper:
         signals = 0
         parsed = 0
 
-        for pair in all_pairs:
-            if not pair or not isinstance(pair, dict):
+        for token in all_tokens:
+            if not token or not isinstance(token, Token):
                 continue
-            addr = pair.get('pairAddress', '')
-            if not addr or addr in seen:
+            uid = token.get_unique_id()
+            if uid in seen:
                 continue
-            seen.add(addr)
-
-            token = self.parse_token(pair)
-            if not token:
-                continue
+            seen.add(uid)
 
             parsed += 1
-            uid = token.get_unique_id()
 
             if self.is_token_dead(uid):
                 continue
@@ -1682,7 +1895,7 @@ class PumpSniper:
         self.stats['whale_buys_found'] = whale_buys
 
         sources_str = ' | '.join(scan_sources)
-        print(Fore.CYAN + f"[{self.stats['last_scan']}] Scanned {parsed} pairs from {sources_str}")
+        print(Fore.CYAN + f"[{self.stats['last_scan']}] Scanned {parsed} tokens from {sources_str}")
 
         if signals > 0:
             top = sorted(self.hot_tokens.values(), key=lambda x: x.insider_score, reverse=True)[:5]
@@ -1703,7 +1916,9 @@ class PumpSniper:
         positions_to_close = []
 
         for pos in self.positions:
-            status, pair = self.check_pair_status(pos.chain, pos.pair_address)
+            # Use contract address for PumpPortal API
+            token_address = pos.contract if pos.contract else pos.pair_address
+            status, pair = self.check_pair_status(pos.chain, token_address)
 
             if status == 'dead':
                 pos.fetch_failures += 1
@@ -1916,14 +2131,14 @@ class PumpSniper:
             # 1. Transaction fee (in USD)
             sol_price = PAPER_SOL_PRICE_DEFAULT
             try:
-                # Try to get current SOL price
+                # Try to get current SOL price from PumpPortal
                 import requests as req
-                r = req.get(f"https://api.dexscreener.com/latest/dex/tokens/{SOL_MINT}", timeout=5)
+                r = req.get(f"{PUMPPORTAL_TOKEN_API}So11111111111111111111111111111111111111112", timeout=5)
                 if r.status_code == 200:
                     data = r.json()
-                    pairs = data.get("pairs", [])
-                    if pairs:
-                        sol_price = float(pairs[0].get("priceUsd", PAPER_SOL_PRICE_DEFAULT))
+                    price = float(data.get("priceUsd", 0) or data.get("price_usd", 0) or 0)
+                    if price > 0:
+                        sol_price = price
             except:
                 pass
 
@@ -2077,16 +2292,16 @@ class PumpSniper:
         paper_sell_fee_usd = 0
 
         if PAPER_TRADE and PAPER_REALISTIC_FEES:
-            # Get SOL price for fee calculation
+            # Get SOL price for fee calculation from PumpPortal
             sol_price = PAPER_SOL_PRICE_DEFAULT
             try:
                 import requests as req
-                r = req.get(f"https://api.dexscreener.com/latest/dex/tokens/{SOL_MINT}", timeout=5)
+                r = req.get(f"{PUMPPORTAL_TOKEN_API}So11111111111111111111111111111111111111112", timeout=5)
                 if r.status_code == 200:
                     data = r.json()
-                    pairs = data.get("pairs", [])
-                    if pairs:
-                        sol_price = float(pairs[0].get("priceUsd", PAPER_SOL_PRICE_DEFAULT))
+                    price = float(data.get("priceUsd", 0) or data.get("price_usd", 0) or 0)
+                    if price > 0:
+                        sol_price = price
             except:
                 pass
 
@@ -2176,15 +2391,13 @@ class PumpSniper:
         if not PAPER_TRADE and self.real_trader:
             try:
                 sol_balance = self.real_trader.get_sol_balance()
-                # Get SOL price synchronously
+                # Get SOL price synchronously from PumpPortal
                 try:
-                    r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{SOL_MINT}", timeout=10)
+                    r = requests.get(f"{PUMPPORTAL_TOKEN_API}So11111111111111111111111111111111111111112", timeout=10)
                     if r.status_code == 200:
                         data = r.json()
-                        pairs = data.get("pairs", [])
-                        if pairs:
-                            sol_price = float(pairs[0].get("priceUsd", 150))
-                        else:
+                        sol_price = float(data.get("priceUsd", 0) or data.get("price_usd", 0) or 150)
+                        if sol_price <= 0:
                             sol_price = 150.0
                     else:
                         sol_price = 150.0
