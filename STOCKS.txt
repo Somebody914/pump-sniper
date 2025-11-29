@@ -1089,6 +1089,8 @@ class PumpFunWebSocket:
         self.tokens = []
         self.connected = False
         self.lock = threading.Lock()
+        self.connect_event = threading.Event()
+        self._thread = None
 
     def on_message(self, ws, message):
         """Handle incoming WebSocket messages"""
@@ -1098,6 +1100,7 @@ class PumpFunWebSocket:
                 return
             if message.startswith('40'):  # Socket.io connected
                 self.connected = True
+                self.connect_event.set()
                 # Subscribe to new tokens
                 ws.send('42["subscribe",{"type":"newTokens"}]')
                 ws.send('42["subscribe",{"type":"tradeCreated"}]')
@@ -1117,7 +1120,11 @@ class PumpFunWebSocket:
                     elif event_type in ['tradeCreated', 'trade']:
                         # Could track trades for volume data
                         pass
+        except json.JSONDecodeError:
+            # Ignore malformed JSON messages (common with socket.io protocol)
+            pass
         except Exception:
+            # Silently ignore other parsing errors to prevent spam during normal operation
             pass
 
     def on_error(self, ws, error):
@@ -1125,15 +1132,18 @@ class PumpFunWebSocket:
 
     def on_close(self, ws, close_status_code, close_msg):
         self.connected = False
+        self.connect_event.clear()
         print(Fore.YELLOW + f"   WebSocket closed")
 
     def on_open(self, ws):
         print(Fore.GREEN + f"   ✓ WebSocket connected!")
         self.connected = True
+        self.connect_event.set()
 
     def connect(self):
         """Connect to Pump.fun WebSocket"""
         try:
+            self.connect_event.clear()
             self.ws = websocket.WebSocketApp(
                 PUMPFUN_WS_URL,
                 on_open=self.on_open,
@@ -1143,13 +1153,13 @@ class PumpFunWebSocket:
             )
 
             # Run in background thread
-            thread = threading.Thread(target=self.ws.run_forever)
-            thread.daemon = True
-            thread.start()
+            self._thread = threading.Thread(target=self.ws.run_forever)
+            self._thread.daemon = True
+            self._thread.start()
 
-            # Wait for connection
-            time.sleep(2)
-            return self.connected
+            # Wait for connection with timeout using threading.Event
+            connection_established = self.connect_event.wait(timeout=5)
+            return connection_established and self.connected
         except Exception as e:
             print(Fore.RED + f"   WebSocket connect error: {e}")
             return False
@@ -1160,8 +1170,11 @@ class PumpFunWebSocket:
             return list(self.tokens)
 
     def close(self):
+        """Gracefully close the WebSocket connection"""
         if self.ws:
             self.ws.close()
+        self.connected = False
+        self.connect_event.clear()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1652,6 +1665,7 @@ class PumpSniper:
                 print(Fore.GREEN + f"   ✓ Got {len(txs)} Pump.fun transactions from Helius")
 
                 tokens = []
+                seen_mints = set()  # Use set for O(1) lookup instead of O(n) list search
                 for tx in txs:
                     # Extract token mints from transaction data
                     try:
@@ -1659,7 +1673,8 @@ class PumpSniper:
                         token_balances = tx.get('tokenTransfers', [])
                         for transfer in token_balances:
                             mint = transfer.get('mint', '')
-                            if mint and mint not in [t.get('mint') for t in tokens]:
+                            if mint and mint not in seen_mints:
+                                seen_mints.add(mint)
                                 tokens.append({'mint': mint, 'source': 'helius'})
                     except Exception:
                         continue
