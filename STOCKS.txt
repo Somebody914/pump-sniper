@@ -11,7 +11,7 @@ import asyncio
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # REAL TRADING IMPORTS - Install with:
-# pip install solana solders httpx base58 --break-system-packages
+# pip install solana solders httpx base58 websocket-client --break-system-packages
 # ═══════════════════════════════════════════════════════════════════════════════
 try:
     import base58
@@ -28,6 +28,22 @@ except ImportError:
     REAL_TRADING_AVAILABLE = False
     print("⚠️ Real trading packages not installed. Run:")
     print("   pip install solana solders httpx base58 --break-system-packages")
+
+# WebSocket import for Pump.fun real-time feed
+try:
+    import websocket
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
+    print("⚠️ websocket-client not installed. Run:")
+    print("   pip install websocket-client --break-system-packages")
+
+# Optional pumpfun library
+try:
+    from pumpfun import PumpFun
+    PUMPFUN_LIB_AVAILABLE = True
+except ImportError:
+    PUMPFUN_LIB_AVAILABLE = False
 
 init(autoreset=True)
 
@@ -138,6 +154,11 @@ SOL_MINT = "So11111111111111111111111111111111111111112"
 SLIPPAGE_BPS = 250  # 2.5% slippage for buys (was 10% - way too high!)
 SELL_SLIPPAGE_BPS = 400  # 4% slippage for sells (was 12%)
 MIN_SOL_KEEP = 0.02  # Keep for fees
+
+# Pump.fun constants
+PUMPFUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+ETHEREUM_ADDRESS_PREFIX = "0x"
+BASE58_CHARS = set('123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz')
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TRANSACTION SETTINGS - Uses balance checking, not RPC confirmation
@@ -809,9 +830,10 @@ class Token:
     alert_reasons: list = field(default_factory=list)
 
     def get_chart_url(self) -> str:
-        if self.dex_url:
-            return self.dex_url
-        return f"https://dexscreener.com/{self.chain}/{self.pair_address}"
+        # ALWAYS return pump.fun link for Solana tokens
+        if self.contract:
+            return f"https://pump.fun/{self.contract}"
+        return f"https://pump.fun/{self.pair_address}"
 
     def get_unique_id(self) -> str:
         return f"{self.chain}_{self.pair_address}"
@@ -849,7 +871,10 @@ class Position:
     tx_hash: str = ''  # NEW: Store transaction hash for reference
 
     def get_chart_url(self) -> str:
-        return self.dex_url or f"https://dexscreener.com/{self.chain}/{self.pair_address}"
+        # ALWAYS return pump.fun link for Solana tokens
+        if self.contract:
+            return f"https://pump.fun/{self.contract}"
+        return f"https://pump.fun/{self.pair_address}"
 
     def get_hold_time_minutes(self) -> float:
         return (time.time() - self.entry_time) / 60
@@ -1060,6 +1085,155 @@ class InsiderDetector:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# PUMP.FUN WEBSOCKET - Real-time token feed
+# ═══════════════════════════════════════════════════════════════════════════════
+class PumpFunWebSocket:
+    """WebSocket connection to receive Pump.fun tokens in real-time"""
+    
+    def __init__(self):
+        self.ws = None
+        self.tokens = []  # Store received tokens
+        self.connected = False
+        self.lock = threading.Lock()
+        self.ws_thread = None
+        self.running = False
+        
+    def start(self):
+        """Start the WebSocket connection in a background thread"""
+        if self.running:
+            return
+        self.running = True
+        self.ws_thread = threading.Thread(target=self._run_websocket, daemon=True)
+        self.ws_thread.start()
+        
+    def stop(self):
+        """Stop the WebSocket connection"""
+        self.running = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+    
+    def _run_websocket(self):
+        """Run the WebSocket connection with proper exit checking"""
+        import websocket
+        
+        ws_urls = [
+            "wss://pumpportal.fun/api/data",
+            "wss://frontend-api.pump.fun/socket.io/?EIO=4&transport=websocket",
+        ]
+        
+        while self.running:
+            for ws_url in ws_urls:
+                if not self.running:
+                    break
+                try:
+                    print(Fore.CYAN + f"   📡 Connecting to WebSocket: {ws_url[:40]}...")
+                    self.ws = websocket.WebSocketApp(
+                        ws_url,
+                        on_open=self._on_open,
+                        on_message=self._on_message,
+                        on_error=self._on_error,
+                        on_close=self._on_close
+                    )
+                    # Run with periodic exit check
+                    self.ws.run_forever(ping_interval=30, ping_timeout=10)
+                    if not self.running:
+                        break
+                except Exception as e:
+                    print(Fore.YELLOW + f"   WS connection error: {e}")
+                    if self.running:
+                        time.sleep(5)
+            # After trying all URLs, wait before retrying
+            if self.running:
+                time.sleep(10)
+    
+    def _on_open(self, ws):
+        """Handle WebSocket connection opened"""
+        self.connected = True
+        print(Fore.GREEN + "   ✓ WebSocket connected!")
+        # Subscribe to new token events
+        try:
+            ws.send(json.dumps({"method": "subscribeNewToken"}))
+        except Exception:
+            pass
+    
+    def _on_message(self, ws, message):
+        """Handle incoming WebSocket messages"""
+        try:
+            data = json.loads(message)
+            
+            # Handle different message formats
+            if isinstance(data, dict):
+                # Check if it's a token/coin message
+                if 'mint' in data or 'token' in data or 'coin' in data:
+                    with self.lock:
+                        self.tokens.append(data)
+                        symbol = data.get('symbol', data.get('name', 'unknown'))
+                        if symbol and symbol != 'unknown':
+                            print(Fore.GREEN + f"   📡 WS Token: {symbol}")
+                
+                # Handle array of tokens
+                if 'tokens' in data:
+                    with self.lock:
+                        self.tokens.extend(data['tokens'])
+                        print(Fore.GREEN + f"   📡 WS: Got {len(data['tokens'])} tokens")
+                
+                # Handle trades (extract token info)
+                if 'trade' in data or 'type' in data:
+                    mint = data.get('mint') or data.get('token_address')
+                    if mint:
+                        with self.lock:
+                            self.tokens.append({'mint': mint, 'from_ws': True})
+            
+            elif isinstance(data, list):
+                # Array of tokens/trades
+                for item in data:
+                    if isinstance(item, dict) and ('mint' in item or 'address' in item):
+                        with self.lock:
+                            self.tokens.append(item)
+                
+        except json.JSONDecodeError:
+            # Not JSON, might be socket.io format
+            if '42[' in str(message):
+                try:
+                    # Extract JSON from socket.io message
+                    msg_str = str(message)
+                    json_part = msg_str[msg_str.index('['):]
+                    data = json.loads(json_part)
+                    if len(data) >= 2:
+                        event_data = data[1]
+                        if isinstance(event_data, dict) and 'mint' in event_data:
+                            with self.lock:
+                                self.tokens.append(event_data)
+                                print(Fore.GREEN + f"   📡 WS Token: {event_data.get('symbol', '???')}")
+                except (json.JSONDecodeError, ValueError, IndexError):
+                    pass  # Ignore malformed socket.io messages
+        except Exception:
+            pass  # Silently ignore other parse errors
+    
+    def _on_error(self, ws, error):
+        """Handle WebSocket errors"""
+        print(Fore.RED + f"   WS error: {error}")
+        self.connected = False
+    
+    def _on_close(self, ws, close_status_code, close_msg):
+        """Handle WebSocket connection closed"""
+        self.connected = False
+        print(Fore.YELLOW + "   WebSocket disconnected")
+    
+    def get_recent_tokens(self, limit: int = 50) -> list:
+        """Get recent tokens received via WebSocket"""
+        with self.lock:
+            # Copy the tokens we want to return
+            tokens = self.tokens[-limit:] if len(self.tokens) > limit else self.tokens[:]
+            # Trim the list to keep memory bounded
+            self.tokens = self.tokens[-100:]
+            return tokens
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN BOT CLASS - WITH FIXES
 # ═══════════════════════════════════════════════════════════════════════════════
 class PumpSniper:
@@ -1076,6 +1250,29 @@ class PumpSniper:
         self.dead_tokens: set[str] = set()
 
         self.insider = InsiderDetector()
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PUMP.FUN WEBSOCKET - Real-time token feed
+        # ═══════════════════════════════════════════════════════════════════
+        self.pumpfun_ws = None
+        if WEBSOCKET_AVAILABLE:
+            try:
+                self.pumpfun_ws = PumpFunWebSocket()
+                self.pumpfun_ws.start()
+                print(Fore.GREEN + "✓ Pump.fun WebSocket initialized")
+            except Exception as e:
+                print(Fore.YELLOW + f"⚠️ WebSocket init failed: {e}")
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # PUMPFUN LIBRARY - Optional
+        # ═══════════════════════════════════════════════════════════════════
+        self.pumpfun_client = None
+        if PUMPFUN_LIB_AVAILABLE:
+            try:
+                self.pumpfun_client = PumpFun()
+                print(Fore.GREEN + "✓ pumpfun library initialized")
+            except Exception as e:
+                print(Fore.YELLOW + f"⚠️ pumpfun library init failed: {e}")
 
         # ═══════════════════════════════════════════════════════════════════
         # NEW: Track pending buys to prevent double-execution
@@ -1444,6 +1641,10 @@ class PumpSniper:
 
             if not chain or not pair_addr:
                 return None
+            
+            # ONLY accept Solana tokens - filter out BSC, ETH, etc.
+            if chain != 'solana':
+                return None
 
             unique_id = f"{chain}_{pair_addr}"
             if self.is_token_dead(unique_id):
@@ -1485,7 +1686,7 @@ class PumpSniper:
                 buys_1h=int(txns_1h.get('buys', 0) or 0),
                 sells_1h=int(txns_1h.get('sells', 0) or 0),
                 age_minutes=age_min,
-                dex_url=pair.get('url', f"https://dexscreener.com/{chain}/{pair_addr}"),
+                dex_url=f"https://pump.fun/{base.get('address', pair_addr)}" if chain == 'solana' else pair.get('url', f"https://dexscreener.com/{chain}/{pair_addr}"),
                 dex_id=pair.get('dexId', '').lower(),
                 first_seen_price=price
             )
@@ -1516,54 +1717,36 @@ class PumpSniper:
         return score
 
     def scan_for_pumps(self):
+        """Scan for Pump.fun tokens ONLY - no DexScreener scanning"""
         self.scanning = True
         self.stats['last_scan'] = datetime.datetime.now().strftime('%H:%M:%S')
 
-        all_pairs = []
+        print(Fore.CYAN + f"[{self.stats['last_scan']}] Scanning Pump.fun...")
+
+        all_tokens = []
         scan_sources = []
 
-        # 1. TOKEN PROFILES
-        try:
-            r = requests.get("https://api.dexscreener.com/token-boosts/top/v1", timeout=8)
-            if r.status_code == 200:
-                boosted = r.json()
-                scan_sources.append(f"Boosted:{len(boosted)}")
-                for item in boosted[:30]:
-                    addr = item.get('tokenAddress', '')
-                    if addr:
-                        p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{addr}")
-                        all_pairs.extend(p[:3])
-                        time.sleep(0.15)
-        except Exception as e:
-            print(Fore.RED + f"Boost fetch error: {e}")
+        # ═══════════════════════════════════════════════════════════════════
+        # SOURCE 1: WebSocket tokens
+        # ═══════════════════════════════════════════════════════════════════
+        if self.pumpfun_ws and self.pumpfun_ws.connected:
+            ws_tokens = self.pumpfun_ws.get_recent_tokens()
+            if ws_tokens:
+                all_tokens.extend(ws_tokens)
+                scan_sources.append(f"WebSocket:{len(ws_tokens)}")
+                print(Fore.GREEN + f"   ✓ WebSocket: {len(ws_tokens)} tokens")
 
-        # 2. LATEST TOKEN PROFILES
-        try:
-            r = requests.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=8)
-            if r.status_code == 200:
-                latest = r.json()
-                scan_sources.append(f"Latest:{len(latest)}")
-                for item in latest[:20]:
-                    addr = item.get('tokenAddress', '')
-                    if addr:
-                        p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{addr}")
-                        all_pairs.extend(p[:2])
-                        time.sleep(0.15)
-        except Exception as e:
-            print(Fore.RED + f"Latest fetch error: {e}")
+        # ═══════════════════════════════════════════════════════════════════
+        # SOURCE 2: Helius API - Get transactions from Pump.fun program
+        # ═══════════════════════════════════════════════════════════════════
+        helius_tokens = self.scan_via_helius()
+        if helius_tokens:
+            all_tokens.extend(helius_tokens)
+            scan_sources.append(f"Helius:{len(helius_tokens)}")
 
-        # 3. SEARCH HOT TERMS
-        hot_terms = ['pump', 'moon', 'pepe', 'doge', 'shib', 'ape', 'wojak', 'chad', 'based', 'send']
-        for term in hot_terms:
-            try:
-                pairs = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/search?q={term}")
-                all_pairs.extend(pairs[:15])
-                time.sleep(0.2)
-            except:
-                pass
-        scan_sources.append(f"Search:{len(hot_terms)}terms")
-
-        # 4. PUMP.FUN - Enhanced scanning for fresh launches
+        # ═══════════════════════════════════════════════════════════════════
+        # SOURCE 3: Pump.fun API - Direct scanning
+        # ═══════════════════════════════════════════════════════════════════
         # Scan Pump.fun NEW coins
         try:
             r = requests.get(
@@ -1572,21 +1755,16 @@ class PumpSniper:
             )
             if r.status_code == 200:
                 coins = r.json()
-                scan_sources.append(f"PumpFun-New:{len(coins)}")
-                for coin in coins[:PUMPFUN_COINS_LIMIT]:  # Check more coins
-                    mint = coin.get('mint', '')
-                    if mint:
-                        # Get market cap from pump.fun data if available
-                        mcap = float(coin.get('usd_market_cap', 0) or 0)
-                        # Fetch if no mcap data OR if mcap is in valid range
-                        if mcap == 0 or mcap < MAX_MARKET_CAP:
-                            p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
-                            all_pairs.extend(p[:2])
-                        time.sleep(0.1)
-        except:
-            pass
+                if isinstance(coins, list):
+                    scan_sources.append(f"PumpFun-New:{len(coins)}")
+                    for coin in coins[:PUMPFUN_COINS_LIMIT]:
+                        if isinstance(coin, dict) and coin.get('mint'):
+                            all_tokens.append(coin)
+                    print(Fore.GREEN + f"   ✓ Pump.fun New: {min(len(coins), PUMPFUN_COINS_LIMIT)} tokens")
+        except Exception as e:
+            print(Fore.YELLOW + f"   Pump.fun API (new) error: {e}")
 
-        # Scan Pump.fun GRADUATING/ACTIVE coins (about to hit Raydium - high potential!)
+        # Scan Pump.fun ACTIVE/GRADUATING coins
         try:
             r = requests.get(
                 "https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=last_trade_timestamp&order=desc",
@@ -1594,45 +1772,65 @@ class PumpSniper:
             )
             if r.status_code == 200:
                 coins = r.json()
-                scan_sources.append(f"PumpFun-Active:{len(coins)}")
-                for coin in coins[:PUMPFUN_COINS_LIMIT]:
-                    mint = coin.get('mint', '')
-                    mcap = float(coin.get('usd_market_cap', 0) or 0)
-                    # Look for coins with good market cap that are actively trading
-                    if mint and (mcap == 0 or (mcap > MIN_MARKET_CAP and mcap < MAX_MARKET_CAP)):
-                        p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
-                        all_pairs.extend(p[:2])
-                        time.sleep(0.1)
-        except:
-            pass
+                if isinstance(coins, list):
+                    scan_sources.append(f"PumpFun-Active:{len(coins)}")
+                    for coin in coins[:PUMPFUN_COINS_LIMIT]:
+                        if isinstance(coin, dict) and coin.get('mint'):
+                            all_tokens.append(coin)
+                    print(Fore.GREEN + f"   ✓ Pump.fun Active: {min(len(coins), PUMPFUN_COINS_LIMIT)} tokens")
+        except Exception as e:
+            print(Fore.YELLOW + f"   Pump.fun API (active) error: {e}")
 
-        # 5. CHAIN SEARCHES
-        for chain in ['solana', 'base', 'bsc']:
+        # ═══════════════════════════════════════════════════════════════════
+        # SOURCE 4: pumpfun library (if available)
+        # ═══════════════════════════════════════════════════════════════════
+        if PUMPFUN_LIB_AVAILABLE and self.pumpfun_client:
             try:
-                pairs = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/search?q=chain:{chain}")
-                all_pairs.extend(pairs[:20])
-                time.sleep(0.2)
-            except:
-                pass
+                for method in ['get_coins', 'get_new_coins', 'get_latest', 'coins', 'get_tokens']:
+                    if hasattr(self.pumpfun_client, method):
+                        try:
+                            result = getattr(self.pumpfun_client, method)(limit=50)
+                            if result and isinstance(result, list):
+                                all_tokens.extend(result)
+                                scan_sources.append(f"pumpfun.{method}:{len(result)}")
+                                print(Fore.GREEN + f"   ✓ pumpfun.{method}: {len(result)} tokens")
+                                break
+                        except Exception:
+                            continue
+            except Exception as e:
+                print(Fore.YELLOW + f"   pumpfun library: {e}")
 
-        # ANALYZE
+        if not all_tokens:
+            print(Fore.RED + "   ❌ No tokens found from any source!")
+            self.scanning = False
+            return
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PROCESS TOKENS - Remove duplicates and analyze
+        # ═══════════════════════════════════════════════════════════════════
+        seen_mints = set()
+        unique_tokens = []
+        for t in all_tokens:
+            if not isinstance(t, dict):
+                continue
+            mint = t.get('mint') or t.get('address') or t.get('token_address') or ''
+            if mint and mint not in seen_mints and self.is_valid_solana_address(mint):
+                seen_mints.add(mint)
+                unique_tokens.append(t)
+
+        print(Fore.GREEN + f"   Processing {len(unique_tokens)} unique tokens...")
+
+        # Reset hot tokens for this scan
         self.hot_tokens = {}
-        seen = set()
         new_tokens = 0
         vol_spikes = 0
         whale_buys = 0
         signals = 0
         parsed = 0
 
-        for pair in all_pairs:
-            if not pair or not isinstance(pair, dict):
-                continue
-            addr = pair.get('pairAddress', '')
-            if not addr or addr in seen:
-                continue
-            seen.add(addr)
-
-            token = self.parse_token(pair)
+        # Process each Pump.fun token
+        for token_data in unique_tokens[:50]:  # Limit to 50 per scan
+            token = self.process_pumpfun_token(token_data)
             if not token:
                 continue
 
@@ -1657,10 +1855,10 @@ class PumpSniper:
             # Market cap checks
             if token.market_cap > 0:
                 if token.market_cap > MAX_MARKET_CAP:
-                    passes_filters = False  # Too big, already pumped
+                    passes_filters = False
                     self.stats['high_mcap_skipped'] += 1
                 if token.market_cap < MIN_MARKET_CAP:
-                    passes_filters = False  # Too small, might be dead
+                    passes_filters = False
                     self.stats['low_mcap_skipped'] += 1
 
             # Check insider score threshold
@@ -1671,10 +1869,11 @@ class PumpSniper:
             if (passes_filters and
                     not self.is_on_cooldown(uid) and
                     not self.is_holding(uid) and
-                    not self.is_pending_buy(uid)):  # NEW: Check pending buys
+                    not self.is_pending_buy(uid)):
                 self.hot_tokens[uid] = token
                 signals += 1
 
+        # Update stats
         self.stats['total_scanned'] += parsed
         self.stats['insider_signals'] = signals
         self.stats['new_tokens_found'] = new_tokens
@@ -1682,18 +1881,223 @@ class PumpSniper:
         self.stats['whale_buys_found'] = whale_buys
 
         sources_str = ' | '.join(scan_sources)
-        print(Fore.CYAN + f"[{self.stats['last_scan']}] Scanned {parsed} pairs from {sources_str}")
+        print(Fore.CYAN + f"   Sources: {sources_str}")
 
         if signals > 0:
             top = sorted(self.hot_tokens.values(), key=lambda x: x.insider_score, reverse=True)[:5]
             print(Fore.RED + f"🚨 {signals} SIGNALS: ", end="")
             for t in top:
+                chart_url = f"https://pump.fun/{t.contract}"
                 print(f"{t.symbol}({t.insider_score:.0f}) ", end="")
             print()
         else:
-            print(Fore.YELLOW + f"No signals meeting threshold (min score: {MIN_INSIDER_SCORE})")
+            print(Fore.YELLOW + f"   No signals passing filters (min score: {MIN_INSIDER_SCORE})")
 
         self.scanning = False
+
+    def is_valid_solana_address(self, address: str) -> bool:
+        """Check if address is a valid Solana address (base58, 32-44 chars)"""
+        if not address or not isinstance(address, str):
+            return False
+        # Skip Ethereum addresses
+        if address.startswith(ETHEREUM_ADDRESS_PREFIX):
+            return False
+        # Solana addresses are 32-44 characters, base58 encoded
+        if len(address) < 32 or len(address) > 44:
+            return False
+        # Check for valid base58 characters
+        return all(c in BASE58_CHARS for c in address)
+
+    def scan_via_helius(self) -> list:
+        """Get new Pump.fun tokens via Helius API"""
+        if not HELIUS_API_KEY or len(HELIUS_API_KEY) < 10:
+            print(Fore.YELLOW + "   No Helius API key")
+            return []
+
+        tokens = []
+        try:
+            url = f"https://api.helius.xyz/v0/addresses/{PUMPFUN_PROGRAM_ID}/transactions?api-key={HELIUS_API_KEY}&limit=100"
+            r = requests.get(url, timeout=15)
+
+            if r.status_code == 200:
+                txs = r.json()
+                print(Fore.CYAN + f"   Helius: {len(txs)} transactions")
+
+                seen_mints = set()
+                for tx in txs:
+                    if not isinstance(tx, dict):
+                        continue
+                        
+                    # Method 1: tokenTransfers
+                    for transfer in tx.get('tokenTransfers', []):
+                        if not isinstance(transfer, dict):
+                            continue
+                        mint = transfer.get('mint')
+                        if mint and mint not in seen_mints and mint != SOL_MINT:
+                            if self.is_valid_solana_address(mint):
+                                seen_mints.add(mint)
+
+                    # Method 2: Look in instructions for token mints
+                    for ix in tx.get('instructions', []):
+                        if not isinstance(ix, dict):
+                            continue
+                        accounts = ix.get('accounts', [])
+                        for acc in accounts:
+                            if isinstance(acc, str) and len(acc) >= 32 and len(acc) <= 44:
+                                if acc not in seen_mints and acc != SOL_MINT:
+                                    if self.is_valid_solana_address(acc):
+                                        seen_mints.add(acc)
+
+                    # Method 3: accountData
+                    for acc_data in tx.get('accountData', []):
+                        if not isinstance(acc_data, dict):
+                            continue
+                        mint = acc_data.get('account')
+                        if mint and mint not in seen_mints and mint != SOL_MINT:
+                            if self.is_valid_solana_address(mint):
+                                seen_mints.add(mint)
+
+                print(Fore.GREEN + f"   ✓ Found {len(seen_mints)} unique token mints from Helius")
+
+                # Create token data for each mint
+                for mint in list(seen_mints)[:30]:  # Limit to 30
+                    tokens.append({
+                        'mint': mint,
+                        'symbol': mint[:6],
+                        'name': 'Pump.fun Token',
+                        'source': 'helius'
+                    })
+            else:
+                print(Fore.YELLOW + f"   Helius API error: {r.status_code}")
+
+        except Exception as e:
+            print(Fore.RED + f"   Helius error: {e}")
+
+        return tokens
+
+    def process_pumpfun_token(self, token_data: dict) -> Token:
+        """Process a Pump.fun token and create Token object"""
+        try:
+            mint = token_data.get('mint') or token_data.get('address') or token_data.get('token_address')
+            
+            # ONLY accept valid Solana addresses
+            if not mint or not self.is_valid_solana_address(mint):
+                return None
+
+            symbol = str(token_data.get('symbol', token_data.get('name', mint[:6])))[:12]
+            name = str(token_data.get('name', 'Pump.fun Token'))[:30]
+            
+            # Get market data from pump.fun response
+            price = float(token_data.get('price', 0) or token_data.get('usd_price', 0) or 0)
+            market_cap = float(token_data.get('usd_market_cap', 0) or token_data.get('market_cap', 0) or 0)
+            
+            # Try to get more data from DexScreener for this specific token (Solana only)
+            pair_data = None
+            if price <= 0 or market_cap <= 0:
+                try:
+                    r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5)
+                    if r.status_code == 200:
+                        data = r.json()
+                        pairs = data.get('pairs', [])
+                        # Only use Solana pairs
+                        for p in pairs:
+                            if p.get('chainId') == 'solana':
+                                pair_data = p
+                                break
+                except Exception:
+                    pass  # Continue without DexScreener data
+
+            # Use pair data if available
+            liquidity = 0
+            volume_5m = 0
+            volume_1h = 0
+            change_5m = 0
+            change_1h = 0
+            buys_5m = 0
+            sells_5m = 0
+            age_minutes = 9999
+            pair_address = mint  # Use mint as pair address for Pump.fun
+
+            if pair_data:
+                price = float(pair_data.get('priceUsd', 0) or 0) if price <= 0 else price
+                market_cap = float(pair_data.get('fdv', 0) or 0) if market_cap <= 0 else market_cap
+                
+                liq = pair_data.get('liquidity', {})
+                liquidity = float(liq.get('usd', 0) or 0) if isinstance(liq, dict) else 0
+                
+                vol = pair_data.get('volume', {})
+                volume_5m = float(vol.get('m5', 0) or 0) if isinstance(vol, dict) else 0
+                volume_1h = float(vol.get('h1', 0) or 0) if isinstance(vol, dict) else 0
+                
+                pc = pair_data.get('priceChange', {})
+                change_5m = float(pc.get('m5', 0) or 0) if isinstance(pc, dict) else 0
+                change_1h = float(pc.get('h1', 0) or 0) if isinstance(pc, dict) else 0
+                
+                txns = pair_data.get('txns', {})
+                txns_5m = txns.get('m5', {}) if isinstance(txns, dict) else {}
+                buys_5m = int(txns_5m.get('buys', 0) or 0)
+                sells_5m = int(txns_5m.get('sells', 0) or 0)
+                
+                created = pair_data.get('pairCreatedAt', 0)
+                if created:
+                    age_minutes = (time.time() * 1000 - created) / (1000 * 60)
+                
+                pair_address = pair_data.get('pairAddress', mint)
+            else:
+                # Try to get age from pump.fun data
+                created_ts = token_data.get('created_timestamp', 0)
+                if created_ts:
+                    age_minutes = (time.time() - created_ts / 1000) / 60
+                    
+                # Get volume/activity from pump.fun data if available
+                volume_1h = float(token_data.get('volume', 0) or 0)
+
+            # Skip if no price or below minimum liquidity
+            if price <= 0:
+                return None
+            if liquidity > 0 and liquidity < MIN_LIQUIDITY:
+                return None
+
+            # Create token with pump.fun URL
+            token = Token(
+                symbol=symbol,
+                name=name,
+                chain='solana',  # ALWAYS solana
+                contract=mint,
+                pair_address=pair_address,
+                price=price,
+                market_cap=market_cap,
+                liquidity=liquidity,
+                volume_5m=volume_5m,
+                volume_1h=volume_1h,
+                volume_24h=0,
+                change_5m=change_5m,
+                change_1h=change_1h,
+                change_24h=0,
+                buys_5m=buys_5m,
+                sells_5m=sells_5m,
+                buys_1h=0,
+                sells_1h=0,
+                age_minutes=age_minutes,
+                dex_url=f"https://pump.fun/{mint}",  # ALWAYS pump.fun
+                dex_id='pumpfun',
+                first_seen_price=price
+            )
+
+            # Analyze for insider signals
+            signals = self.insider.analyze_token(token, {})
+            token.insider_score = signals['score']
+            token.alert_reasons = signals['reasons']
+            token.is_new_token = signals['is_new']
+            token.is_volume_spike = signals['volume_spike']
+            token.is_whale_accumulating = signals['whale_buy']
+            token.is_coordinated_buy = signals['coordinated']
+            token.pump_score = self.calculate_pump_score(token)
+
+            return token
+
+        except Exception as e:
+            return None
 
     def update_positions(self):
         if not self.positions:
