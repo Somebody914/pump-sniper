@@ -14,6 +14,19 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════════
+# Threshold for detecting bundled transactions (multiple transfers in one tx)
+BUNDLE_TRANSFER_THRESHOLD = 5
+
+# Timestamp threshold to detect millisecond vs second timestamps
+# Timestamps > 1e12 are likely in milliseconds (after year ~2001 in ms)
+MILLISECOND_TIMESTAMP_THRESHOLD = 1e12
+
+# Default SOL price for liquidity estimation (fallback value)
+DEFAULT_SOL_PRICE_USD = 150.0
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # CANDIDATE DATACLASS - Represents a graduated pump.fun token
 # ═══════════════════════════════════════════════════════════════════════════════
 @dataclass
@@ -201,7 +214,7 @@ class GraduatedScanner:
                         
                         # Check for bundle patterns (multiple transfers in same tx)
                         token_transfers = txn.get('tokenTransfers', [])
-                        if len(token_transfers) > 5:
+                        if len(token_transfers) > BUNDLE_TRANSFER_THRESHOLD:
                             # Multiple transfers in single tx could indicate bundling
                             return True, False
             
@@ -215,6 +228,8 @@ class GraduatedScanner:
         """
         Get holder count and top holder percentage using Helius API.
         
+        Note: Uses Helius DAS API for token account lookup.
+        
         Returns:
             Tuple of (holder_count, top_holder_percent)
         """
@@ -222,13 +237,15 @@ class GraduatedScanner:
             return 0, 0.0
         
         try:
-            # Use Helius to get token holders
-            url = f"https://api.helius.xyz/v1/mintlist?api-key={self.helius_api_key}"
+            # Use Helius DAS API to get token accounts for this mint
+            # This gives us holder information
+            url = f"https://mainnet.helius-rpc.com/?api-key={self.helius_api_key}"
             payload = {
-                "query": {
-                    "mints": [mint]
-                },
-                "options": {
+                "jsonrpc": "2.0",
+                "id": "holder-check",
+                "method": "getTokenAccounts",
+                "params": {
+                    "mint": mint,
                     "limit": 20
                 }
             }
@@ -236,14 +253,15 @@ class GraduatedScanner:
             
             if r.status_code == 200:
                 data = r.json()
-                # Parse holder data if available
+                # Parse holder data from DAS response
                 if data and 'result' in data:
                     result = data['result']
-                    if result:
-                        holder_count = len(result)
+                    token_accounts = result.get('token_accounts', [])
+                    if token_accounts:
+                        holder_count = len(token_accounts)
                         # Calculate top holder percentage
                         if holder_count > 0:
-                            amounts = [float(h.get('amount', 0)) for h in result]
+                            amounts = [float(acc.get('amount', 0)) for acc in token_accounts]
                             total = sum(amounts)
                             if total > 0:
                                 top_holder_percent = (max(amounts) / total) * 100
@@ -317,7 +335,9 @@ class GraduatedScanner:
             created = token_data.get('created_timestamp')
             if created:
                 try:
-                    age_seconds = time.time() - (created / 1000 if created > 1e12 else created)
+                    # Convert milliseconds to seconds if timestamp is in milliseconds
+                    timestamp_seconds = created / 1000 if created > MILLISECOND_TIMESTAMP_THRESHOLD else created
+                    age_seconds = time.time() - timestamp_seconds
                     age_minutes = max(0, age_seconds / 60)
                 except:
                     pass
@@ -342,8 +362,8 @@ class GraduatedScanner:
                 # Virtual SOL reserves indicate liquidity
                 virtual_sol = float(pair_data.get('virtual_sol_reserves', 0) or 0)
                 if virtual_sol > 0:
-                    # Convert to USD estimate (assuming ~$150 per SOL)
-                    liquidity = virtual_sol * 150 / 1e9  # Reserves are in lamports
+                    # Convert to USD estimate using default SOL price
+                    liquidity = virtual_sol * DEFAULT_SOL_PRICE_USD / 1e9  # Reserves are in lamports
             
             # Create candidate
             candidate = Candidate(

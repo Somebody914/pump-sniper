@@ -781,6 +781,31 @@ class SolanaTrader:
 # ═══════════════════════════════════════════════════════════════════════════════
 # TOKEN AND POSITION DATA CLASSES
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# Simple candidate for fallback scanning when GraduatedScanner module unavailable
+@dataclass
+class SimpleCandidate:
+    """Lightweight candidate for fallback pump.fun scanning."""
+    mint: str
+    symbol: str
+    name: str
+    price: float = 0.0
+    market_cap: float = 0.0
+    liquidity: float = 0.0
+    volume_5m: float = 0.0
+    volume_1h: float = 0.0
+    volume_24h: float = 0.0
+    change_5m: float = 0.0
+    change_1h: float = 0.0
+    change_24h: float = 0.0
+    buys_5m: int = 0
+    sells_5m: int = 0
+    buys_1h: int = 0
+    sells_1h: int = 0
+    age_minutes: float = 9999
+    pair_address: str = ""
+
+
 @dataclass
 class Token:
     symbol: str
@@ -1717,35 +1742,27 @@ class PumpSniper:
                     if coin.get('complete', False) or coin.get('raydium_pool'):
                         mint = coin.get('mint', '')
                         if mint and not mint.startswith('0x') and 32 <= len(mint) <= 44:
-                            # Create a simple Candidate-like object
-                            class SimpleCandidate:
-                                pass
-                            c = SimpleCandidate()
-                            c.mint = mint
-                            c.symbol = coin.get('symbol', 'UNKNOWN')
-                            c.name = coin.get('name', c.symbol)
-                            c.price = 0.0
-                            c.market_cap = float(coin.get('usd_market_cap', 0) or 0)
-                            c.liquidity = 0.0
-                            c.volume_5m = 0.0
-                            c.volume_1h = 0.0
-                            c.volume_24h = 0.0
-                            c.change_5m = 0.0
-                            c.change_1h = 0.0
-                            c.change_24h = 0.0
-                            c.buys_5m = 0
-                            c.sells_5m = 0
-                            c.buys_1h = 0
-                            c.sells_1h = 0
-                            c.age_minutes = 9999
+                            # Calculate age from created_timestamp
+                            age_minutes = 9999
                             created = coin.get('created_timestamp')
                             if created:
                                 try:
-                                    age_s = time.time() - (created / 1000 if created > 1e12 else created)
-                                    c.age_minutes = max(0, age_s / 60)
+                                    # Use 1e12 threshold to detect millisecond timestamps
+                                    timestamp_seconds = created / 1000 if created > 1e12 else created
+                                    age_s = time.time() - timestamp_seconds
+                                    age_minutes = max(0, age_s / 60)
                                 except:
                                     pass
-                            c.pair_address = coin.get('raydium_pool', '')
+                            
+                            # Use module-level SimpleCandidate dataclass
+                            c = SimpleCandidate(
+                                mint=mint,
+                                symbol=coin.get('symbol', 'UNKNOWN'),
+                                name=coin.get('name', coin.get('symbol', 'UNKNOWN')),
+                                market_cap=float(coin.get('usd_market_cap', 0) or 0),
+                                age_minutes=age_minutes,
+                                pair_address=coin.get('raydium_pool', '')
+                            )
                             candidates.append(c)
         except Exception as e:
             print(Fore.RED + f"   Fallback scan error: {e}")
