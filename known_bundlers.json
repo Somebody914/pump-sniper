@@ -1,0 +1,9 @@
+{
+  "description": "Known bundler/sniper wallet addresses that should be avoided when scanning pump.fun tokens",
+  "last_updated": "2024-01-01",
+  "addresses": [
+    "TSLvdd1pWpHVjahSpsvCXUbgwsL3YyCEEueFT7g4oqW",
+    "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9",
+    "DW8dL4YE9tX4N6PJkJvzPQGsLw2wELGNPPQPb4Y1a7qQ"
+  ]
+}

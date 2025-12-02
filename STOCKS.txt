@@ -10,6 +10,16 @@ import webbrowser
 import asyncio
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# PUMP.FUN GRADUATED SCANNER IMPORT
+# ═══════════════════════════════════════════════════════════════════════════════
+try:
+    from pumpfun_graduated import GraduatedScanner, Candidate
+    GRADUATED_SCANNER_AVAILABLE = True
+except ImportError:
+    GRADUATED_SCANNER_AVAILABLE = False
+    print("⚠️ pumpfun_graduated module not found. Install it or check the file path.")
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # REAL TRADING IMPORTS - Install with:
 # pip install solana solders httpx base58 --break-system-packages
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -771,6 +781,31 @@ class SolanaTrader:
 # ═══════════════════════════════════════════════════════════════════════════════
 # TOKEN AND POSITION DATA CLASSES
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# Simple candidate for fallback scanning when GraduatedScanner module unavailable
+@dataclass
+class SimpleCandidate:
+    """Lightweight candidate for fallback pump.fun scanning."""
+    mint: str
+    symbol: str
+    name: str
+    price: float = 0.0
+    market_cap: float = 0.0
+    liquidity: float = 0.0
+    volume_5m: float = 0.0
+    volume_1h: float = 0.0
+    volume_24h: float = 0.0
+    change_5m: float = 0.0
+    change_1h: float = 0.0
+    change_24h: float = 0.0
+    buys_5m: int = 0
+    sells_5m: int = 0
+    buys_1h: int = 0
+    sells_1h: int = 0
+    age_minutes: float = 9999
+    pair_address: str = ""
+
+
 @dataclass
 class Token:
     symbol: str
@@ -811,7 +846,10 @@ class Token:
     def get_chart_url(self) -> str:
         if self.dex_url:
             return self.dex_url
-        return f"https://dexscreener.com/{self.chain}/{self.pair_address}"
+        # Use pump.fun URL for pumpfun tokens
+        if self.dex_id == 'pumpfun' and self.contract:
+            return f"https://pump.fun/{self.contract}"
+        return f"https://pump.fun/{self.contract}" if self.chain == 'solana' and self.contract else f"https://dexscreener.com/{self.chain}/{self.pair_address}"
 
     def get_unique_id(self) -> str:
         return f"{self.chain}_{self.pair_address}"
@@ -849,7 +887,12 @@ class Position:
     tx_hash: str = ''  # NEW: Store transaction hash for reference
 
     def get_chart_url(self) -> str:
-        return self.dex_url or f"https://dexscreener.com/{self.chain}/{self.pair_address}"
+        if self.dex_url:
+            return self.dex_url
+        # Use pump.fun URL for Solana tokens
+        if self.chain == 'solana' and self.contract:
+            return f"https://pump.fun/{self.contract}"
+        return f"https://dexscreener.com/{self.chain}/{self.pair_address}"
 
     def get_hold_time_minutes(self) -> float:
         return (time.time() - self.entry_time) / 60
@@ -1076,6 +1119,19 @@ class PumpSniper:
         self.dead_tokens: set[str] = set()
 
         self.insider = InsiderDetector()
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PUMP.FUN GRADUATED SCANNER INITIALIZATION
+        # ═══════════════════════════════════════════════════════════════════
+        self.graduated_scanner = None
+        if GRADUATED_SCANNER_AVAILABLE:
+            self.graduated_scanner = GraduatedScanner(
+                helius_api_key=HELIUS_API_KEY if HELIUS_API_KEY and len(HELIUS_API_KEY) > 10 else None,
+                known_bundlers_file="known_bundlers.json"
+            )
+            print(Fore.GREEN + "✓ Pump.fun Graduated Scanner initialized")
+        else:
+            print(Fore.YELLOW + "⚠️ Graduated Scanner not available, using fallback scanning")
 
         # ═══════════════════════════════════════════════════════════════════
         # NEW: Track pending buys to prevent double-execution
@@ -1515,126 +1571,98 @@ class PumpSniper:
             score += 10
         return score
 
+    def _candidate_to_token(self, candidate: 'Candidate') -> Token:
+        """Convert a Candidate object from GraduatedScanner to a Token object."""
+        # Use pump.fun URL for graduated tokens
+        pump_url = f"https://pump.fun/{candidate.mint}"
+        
+        token = Token(
+            symbol=candidate.symbol,
+            name=candidate.name,
+            chain='solana',
+            contract=candidate.mint,
+            pair_address=candidate.pair_address or candidate.mint,
+            price=candidate.price,
+            market_cap=candidate.market_cap,
+            liquidity=candidate.liquidity,
+            volume_5m=candidate.volume_5m,
+            volume_1h=candidate.volume_1h,
+            volume_24h=candidate.volume_24h,
+            change_5m=candidate.change_5m,
+            change_1h=candidate.change_1h,
+            change_24h=candidate.change_24h,
+            buys_5m=candidate.buys_5m,
+            sells_5m=candidate.sells_5m,
+            buys_1h=candidate.buys_1h,
+            sells_1h=candidate.sells_1h,
+            age_minutes=candidate.age_minutes,
+            dex_url=pump_url,  # Use pump.fun URL
+            dex_id='pumpfun',  # Mark as pump.fun token
+            first_seen_price=candidate.price
+        )
+        return token
+
     def scan_for_pumps(self):
+        """
+        Scan for pump.fun graduated candidates.
+        Uses GraduatedScanner to find tokens that have graduated to Raydium
+        while filtering out bundled/bundler-bought coins.
+        """
         self.scanning = True
         self.stats['last_scan'] = datetime.datetime.now().strftime('%H:%M:%S')
 
-        all_pairs = []
-        scan_sources = []
-
-        # 1. TOKEN PROFILES
-        try:
-            r = requests.get("https://api.dexscreener.com/token-boosts/top/v1", timeout=8)
-            if r.status_code == 200:
-                boosted = r.json()
-                scan_sources.append(f"Boosted:{len(boosted)}")
-                for item in boosted[:30]:
-                    addr = item.get('tokenAddress', '')
-                    if addr:
-                        p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{addr}")
-                        all_pairs.extend(p[:3])
-                        time.sleep(0.15)
-        except Exception as e:
-            print(Fore.RED + f"Boost fetch error: {e}")
-
-        # 2. LATEST TOKEN PROFILES
-        try:
-            r = requests.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=8)
-            if r.status_code == 200:
-                latest = r.json()
-                scan_sources.append(f"Latest:{len(latest)}")
-                for item in latest[:20]:
-                    addr = item.get('tokenAddress', '')
-                    if addr:
-                        p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{addr}")
-                        all_pairs.extend(p[:2])
-                        time.sleep(0.15)
-        except Exception as e:
-            print(Fore.RED + f"Latest fetch error: {e}")
-
-        # 3. SEARCH HOT TERMS
-        hot_terms = ['pump', 'moon', 'pepe', 'doge', 'shib', 'ape', 'wojak', 'chad', 'based', 'send']
-        for term in hot_terms:
+        # ═══════════════════════════════════════════════════════════════════
+        # PRIMARY: Use GraduatedScanner for pump.fun tokens
+        # ═══════════════════════════════════════════════════════════════════
+        print(Fore.CYAN + f"\n[{self.stats['last_scan']}] 🎓 Scanning Pump.fun graduated candidates...")
+        
+        candidates = []
+        if self.graduated_scanner:
             try:
-                pairs = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/search?q={term}")
-                all_pairs.extend(pairs[:15])
-                time.sleep(0.2)
-            except:
-                pass
-        scan_sources.append(f"Search:{len(hot_terms)}terms")
+                candidates = self.graduated_scanner.scan_graduated_candidates(limit=PUMPFUN_COINS_LIMIT)
+                print(Fore.GREEN + f"   ✓ Found {len(candidates)} graduated candidates from pump.fun")
+            except Exception as e:
+                print(Fore.RED + f"   ❌ GraduatedScanner error: {e}")
+        else:
+            print(Fore.YELLOW + "   ⚠️ GraduatedScanner not available, using fallback...")
+            # Fallback: fetch directly from pump.fun
+            candidates = self._fallback_pump_scan()
 
-        # 4. PUMP.FUN - Enhanced scanning for fresh launches
-        # Scan Pump.fun NEW coins
-        try:
-            r = requests.get(
-                "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=desc",
-                timeout=8
-            )
-            if r.status_code == 200:
-                coins = r.json()
-                scan_sources.append(f"PumpFun-New:{len(coins)}")
-                for coin in coins[:PUMPFUN_COINS_LIMIT]:  # Check more coins
-                    mint = coin.get('mint', '')
-                    if mint:
-                        # Get market cap from pump.fun data if available
-                        mcap = float(coin.get('usd_market_cap', 0) or 0)
-                        # Fetch if no mcap data OR if mcap is in valid range
-                        if mcap == 0 or mcap < MAX_MARKET_CAP:
-                            p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
-                            all_pairs.extend(p[:2])
-                        time.sleep(0.1)
-        except:
-            pass
-
-        # Scan Pump.fun GRADUATING/ACTIVE coins (about to hit Raydium - high potential!)
-        try:
-            r = requests.get(
-                "https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=last_trade_timestamp&order=desc",
-                timeout=8
-            )
-            if r.status_code == 200:
-                coins = r.json()
-                scan_sources.append(f"PumpFun-Active:{len(coins)}")
-                for coin in coins[:PUMPFUN_COINS_LIMIT]:
-                    mint = coin.get('mint', '')
-                    mcap = float(coin.get('usd_market_cap', 0) or 0)
-                    # Look for coins with good market cap that are actively trading
-                    if mint and (mcap == 0 or (mcap > MIN_MARKET_CAP and mcap < MAX_MARKET_CAP)):
-                        p = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
-                        all_pairs.extend(p[:2])
-                        time.sleep(0.1)
-        except:
-            pass
-
-        # 5. CHAIN SEARCHES
-        for chain in ['solana', 'base', 'bsc']:
-            try:
-                pairs = self.fetch_pairs(f"https://api.dexscreener.com/latest/dex/search?q=chain:{chain}")
-                all_pairs.extend(pairs[:20])
-                time.sleep(0.2)
-            except:
-                pass
-
-        # ANALYZE
+        # ═══════════════════════════════════════════════════════════════════
+        # CONVERT CANDIDATES TO TOKENS AND ANALYZE
+        # ═══════════════════════════════════════════════════════════════════
         self.hot_tokens = {}
-        seen = set()
+        seen_mints = set()
         new_tokens = 0
         vol_spikes = 0
         whale_buys = 0
         signals = 0
         parsed = 0
 
-        for pair in all_pairs:
-            if not pair or not isinstance(pair, dict):
+        for candidate in candidates:
+            # Validate Solana address (skip Ethereum addresses)
+            if not candidate.mint or candidate.mint.startswith('0x'):
                 continue
-            addr = pair.get('pairAddress', '')
-            if not addr or addr in seen:
+            if len(candidate.mint) < 32 or len(candidate.mint) > 44:
                 continue
-            seen.add(addr)
+            
+            # Deduplicate by mint
+            if candidate.mint in seen_mints:
+                continue
+            seen_mints.add(candidate.mint)
 
-            token = self.parse_token(pair)
-            if not token:
-                continue
+            # Convert Candidate to Token
+            token = self._candidate_to_token(candidate)
+            
+            # Run through insider detector for scoring
+            signals_data = self.insider.analyze_token(token, {})
+            token.insider_score = signals_data['score']
+            token.alert_reasons = signals_data['reasons']
+            token.is_new_token = signals_data['is_new']
+            token.is_volume_spike = signals_data['volume_spike']
+            token.is_whale_accumulating = signals_data['whale_buy']
+            token.is_coordinated_buy = signals_data['coordinated']
+            token.pump_score = self.calculate_pump_score(token)
 
             parsed += 1
             uid = token.get_unique_id()
@@ -1681,8 +1709,7 @@ class PumpSniper:
         self.stats['volume_spikes_found'] = vol_spikes
         self.stats['whale_buys_found'] = whale_buys
 
-        sources_str = ' | '.join(scan_sources)
-        print(Fore.CYAN + f"[{self.stats['last_scan']}] Scanned {parsed} pairs from {sources_str}")
+        print(Fore.CYAN + f"[{self.stats['last_scan']}] Processed {parsed} graduated candidates")
 
         if signals > 0:
             top = sorted(self.hot_tokens.values(), key=lambda x: x.insider_score, reverse=True)[:5]
@@ -1690,10 +1717,57 @@ class PumpSniper:
             for t in top:
                 print(f"{t.symbol}({t.insider_score:.0f}) ", end="")
             print()
+            # Debug: Show pump.fun URLs
+            print(Fore.CYAN + "📎 Pump.fun URLs for top signals:")
+            for t in top[:3]:
+                print(Fore.CYAN + f"   {t.symbol}: https://pump.fun/{t.contract}")
         else:
             print(Fore.YELLOW + f"No signals meeting threshold (min score: {MIN_INSIDER_SCORE})")
 
         self.scanning = False
+
+    def _fallback_pump_scan(self) -> list:
+        """Fallback pump.fun scanning when GraduatedScanner is not available."""
+        candidates = []
+        try:
+            # Fetch graduated tokens directly
+            r = requests.get(
+                f"https://frontend-api.pump.fun/coins?offset=0&limit={PUMPFUN_COINS_LIMIT}&sort=last_trade_timestamp&order=desc",
+                timeout=10
+            )
+            if r.status_code == 200:
+                coins = r.json()
+                for coin in coins:
+                    # Check if graduated
+                    if coin.get('complete', False) or coin.get('raydium_pool'):
+                        mint = coin.get('mint', '')
+                        if mint and not mint.startswith('0x') and 32 <= len(mint) <= 44:
+                            # Calculate age from created_timestamp
+                            age_minutes = 9999
+                            created = coin.get('created_timestamp')
+                            if created:
+                                try:
+                                    # Use 1e12 threshold to detect millisecond timestamps
+                                    timestamp_seconds = created / 1000 if created > 1e12 else created
+                                    age_s = time.time() - timestamp_seconds
+                                    age_minutes = max(0, age_s / 60)
+                                except:
+                                    pass
+                            
+                            # Use module-level SimpleCandidate dataclass
+                            c = SimpleCandidate(
+                                mint=mint,
+                                symbol=coin.get('symbol', 'UNKNOWN'),
+                                name=coin.get('name', coin.get('symbol', 'UNKNOWN')),
+                                market_cap=float(coin.get('usd_market_cap', 0) or 0),
+                                age_minutes=age_minutes,
+                                pair_address=coin.get('raydium_pool', '')
+                            )
+                            candidates.append(c)
+        except Exception as e:
+            print(Fore.RED + f"   Fallback scan error: {e}")
+        return candidates
+
 
     def update_positions(self):
         if not self.positions:
